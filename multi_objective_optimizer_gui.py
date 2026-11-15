@@ -255,7 +255,7 @@ class MultiObjectiveOptimizer(QMainWindow):
         
         # 为每种图表创建一个标签
         self.viz_images = {}
-        viz_types = ["pareto", "parallel", "radar", "heatmap", "tsp_route", "tsp_front"]
+        viz_types = ["knapsack_front", "tsp_route", "tsp_front"]
         
         for viz_type in viz_types:
             viz_group = QGroupBox(self.get_viz_title(viz_type))
@@ -475,12 +475,9 @@ class MultiObjectiveOptimizer(QMainWindow):
     def get_viz_title(self, viz_type):
         """获取可视化类型的标题"""
         titles = {
-            "pareto": "散点矩阵图",
-            "parallel": "平行坐标图",
-            "radar": "雷达图",
-            "heatmap": "热力图",
+            "knapsack_front": "背包候选帕累托前沿",
             "tsp_route": "TSP 闭合路线",
-            "tsp_front": "TSP 候选帕累托前沿"
+            "tsp_front": "TSP 候选帕累托前沿",
         }
         return titles.get(viz_type, viz_type.title())
     
@@ -501,20 +498,13 @@ class MultiObjectiveOptimizer(QMainWindow):
     
     def refresh_visualization(self):
         """刷新可视化结果"""
-        # 可能的可视化文件路径
-        viz_paths = {
-            "pareto": "solutions/scatter_matrix.png",  # 散点矩阵图
-            "parallel": "solutions/parallel_coordinates.png",
-            "radar": "solutions/radar_chart.png",
-            "heatmap": "solutions/heatmap.png"
-        }
-        
-        is_tsp = self.problem_type.currentText() == "tsp"
-        if is_tsp:
+        if self.problem_type.currentText() == "tsp":
             viz_paths = {
                 "tsp_route": "solutions/tsp_solution.png",
                 "tsp_front": "solutions/tsp_pareto_front.png",
             }
+        else:
+            viz_paths = {"knapsack_front": "solutions/knapsack_pareto_front.png"}
         for viz_type, label in self.viz_images.items():
             label.clear()
             label.parent().setVisible(viz_type in viz_paths)
@@ -550,36 +540,6 @@ class MultiObjectiveOptimizer(QMainWindow):
                     print(f"文件不存在: {abs_path}")
             except Exception as e:
                 print(f"加载可视化图像时出错: {viz_type} - {path}: {str(e)}")
-        
-        # 如果没有找到可视化结果，检查是否有特定图片，但不要加载high_dimensional_solution.png
-        if not found_any and not is_tsp:
-            print("没有找到标准可视化图像，尝试查找通用图像...")
-            generic_paths = [
-                "solutions/latest_solution.png",
-                "visualizations/rl_solution.png"
-            ]
-            
-            for path in generic_paths:
-                try:
-                    abs_path = os.path.join(os.getcwd(), path)
-                    if os.path.exists(abs_path):
-                        print(f"找到通用图像: {abs_path}")
-                        pixmap = QPixmap(abs_path)
-                        if not pixmap.isNull():
-                            # 将通用图像只分配给Pareto前沿标签
-                            if "pareto" in self.viz_images:
-                                self.viz_images["pareto"].setPixmap(pixmap.scaled(
-                                    self.viz_images["pareto"].width(), 
-                                    self.viz_images["pareto"].height(),
-                                    Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                                found_any = True
-                                break
-                        else:
-                            print(f"无法加载通用图像: {abs_path}, pixmap为空")
-                    else:
-                        print(f"通用图像文件不存在: {abs_path}")
-                except Exception as e:
-                    print(f"加载通用图像时出错: {path}: {str(e)}")
         
         if found_any:
             self.statusBar.showMessage("已加载可视化结果")

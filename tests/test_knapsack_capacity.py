@@ -1,7 +1,14 @@
+import json
+import os
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
 import numpy as np
+import torch
+
+from scripts.train import RLTrainer
 
 from src.environments.knapsack_env import KnapsackEnv
 from src.problems.knapsack_problem import KnapsackProblem
@@ -80,3 +87,43 @@ class TestKnapsackCapacity(unittest.TestCase):
         # Each class has a fitting item by itself, but two classes cannot fit together.
         with self.assertRaisesRegex(ValueError, 'Weight 最少需要 2，容量上限为 1'):
             KnapsackEnv(self.make_problem({'Weight': 1}))
+
+    def test_exported_front_matches_exhaustive_one_category_instance(self):
+        items = [[[5, 3], [6, 4], [4, 3], [99, 20]]]
+        config = {
+            'problem': {
+                'type': 'knapsack', 'num_categories': 1, 'items_per_category': 4,
+                'num_objectives': 2, 'objective_names': ['Value', 'Weight'],
+                'objective_types': [1, -1], 'objective_constraints': {'Weight': 5},
+                'items': items,
+            },
+            'model': {'input_dim': 3, 'hidden_dim': 8, 'n_objectives': 2},
+            'training': {
+                'num_episodes': 1, 'buffer_size': 8, 'batch_size': 2,
+                'gamma': 0.99, 'learning_rate': 0.001, 'entropy_weight': 0.01,
+            },
+        }
+        problem = KnapsackProblem(config)
+        trainer = RLTrainer(KnapsackEnv(problem), config)
+        with torch.no_grad():
+            for parameter in trainer.model.parameters():
+                parameter.zero_()
+        previous_directory = Path.cwd()
+        with tempfile.TemporaryDirectory() as directory, torch.random.fork_rng(devices=[]):
+            os.chdir(directory)
+            try:
+                torch.manual_seed(7)
+                metrics, selection, _ = trainer.test(visualize=True)
+                report = json.loads(Path('solutions/knapsack_candidates.json').read_text())
+                self.assertGreater(Path('solutions/knapsack_pareto_front.png').stat().st_size, 0)
+            finally:
+                os.chdir(previous_directory)
+
+        candidates = {tuple(row['selection']): row for row in report['candidates']}
+        self.assertEqual(set(candidates), {(0,), (1,), (2,)})
+        self.assertEqual({key for key, row in candidates.items() if row['nondominated']}, {(0,), (1,)})
+        self.assertEqual(metrics['num_nondominated'], 2)
+        self.assertEqual(selection, report['candidates'][report['selected_index']]['selection'])
+        for key, row in candidates.items():
+            self.assertTrue(problem.is_feasible(key))
+            np.testing.assert_array_equal(row['objectives'], report['items'][0][key[0]])

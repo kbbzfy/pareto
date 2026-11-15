@@ -1537,269 +1537,120 @@ class RLTrainer:
             raise e
 
     def test(self, visualize=False):
-        """测试模型"""
+        """Sample feasible solutions from one evaluation instance."""
         self.model.eval()
         is_tsp = isinstance(self.env, TSPEnv)
-        test_rewards = []
+        rewards = []
         solutions = []
-        objectives_list = []
-        
-        for episode in range(10):  # 测试10个episode
+        objectives = []
+
+        for episode in range(10):
             state = self.env.reset(regenerate=False, start_city=0) if is_tsp else self.env.reset()
             done = False
             episode_reward = 0
-            current_solution = []
-            
+            selection = []
+
             while not done:
-                # 处理状态
-                state_tensor = self._process_state(state)
-                
-                # 获取动作概率
                 with torch.no_grad():
-                    action_probs, _, _ = self.model(state_tensor)
-                
-                # 选择动作
-                distribution = self._action_distribution(action_probs, [state])
-                action = (distribution.sample() if is_tsp and episode > 0 else distribution.probs.argmax()).item()
-                
-                # 执行动作
-                next_state, reward, done, info = self.env.step(action)
+                    action_probs, _, _ = self.model(self._process_state(state))
+                    distribution = self._action_distribution(action_probs, [state])
+                    action = (distribution.sample() if episode else distribution.probs.argmax()).item()
+
+                state, reward, done, info = self.env.step(action)
                 episode_reward += reward
-                state = next_state
-                current_solution.append(action)
-            
-            if isinstance(self.env, KnapsackEnv) and (
-                not info['feasible'] or not self.env.problem.is_feasible(current_solution)
-            ):
-                continue
+                selection.append(action)
 
             if is_tsp:
-                current_solution = info['tour']
-                if not self.env.problem.is_feasible(current_solution):
+                selection = info['tour']
+                if not self.env.problem.is_feasible(selection):
                     raise ValueError("TSP 模型未返回完整闭合路线")
+                values = info['objectives']
+            else:
+                if not info['feasible'] or not self.env.problem.is_feasible(selection):
+                    continue
+                values = self.env.problem.compute_objectives(selection)
 
-            test_rewards.append(episode_reward)
-            solutions.append(current_solution)
-            
-            # 计算目标值
-            if isinstance(self.env, KnapsackEnv):
-                # 使用current_objectives替代单独的current_value等属性
-                objectives = {}
-                
-                # 确保目标与名称一致
-                for i, name in enumerate(self.env.objective_names):
-                    objectives[name.lower()] = self.env.current_objectives[i]
-                
-                # 为兼容性保留原始键名
-                if 'value' not in objectives and len(self.env.current_objectives) > 0:
-                    objectives['value'] = self.env.current_objectives[0]
-                if 'weight' not in objectives and len(self.env.current_objectives) > 1:
-                    objectives['weight'] = self.env.current_objectives[1]
-                if 'volume' not in objectives and len(self.env.current_objectives) > 2:
-                    objectives['volume'] = self.env.current_objectives[2]
-                if 'cost' not in objectives and len(self.env.current_objectives) > 3:
-                    objectives['cost'] = self.env.current_objectives[3]
-                if 'time' not in objectives and len(self.env.current_objectives) > 4:
-                    objectives['time'] = self.env.current_objectives[4]
-                
-                # 添加已选择物品数量
-                objectives['n_selected'] = len(current_solution)
-                
-                # 记录所有目标函数值
-                logging.info(f"初始化了{len(self.env.current_objectives)}个目标函数：{self.env.objective_names}")
-                for i, name in enumerate(self.env.objective_names):
-                    if i < len(self.env.current_objectives):
-                        logging.info(f"目标{i} ({name})值: {self.env.current_objectives[i]}")
-                        if np.isfinite(self.env.capacities[i]):
-                            logging.info(f"目标{i} ({name})容量: {self.env.capacities[i]}")
-                
-                objectives_list.append(objectives)
-            elif is_tsp:
-                objectives_list.append(info['objectives'])
-        
+            rewards.append(episode_reward)
+            solutions.append(selection)
+            objectives.append(values)
+
         if not solutions:
             raise ValueError("模型未找到满足背包容量上限的完整选择")
 
-        if is_tsp:
-            return self._tsp_test_results(solutions, objectives_list, test_rewards, visualize)
+        return self._candidate_test_results(solutions, objectives, rewards, is_tsp, visualize)
 
-        # 找到最佳解决方案
-        best_idx = int(np.argmax(test_rewards))
-        best_solution = solutions[best_idx]
-        best_objectives = objectives_list[best_idx] if objectives_list else None
-        
-        results = {
-            'mean_reward': float(np.mean(test_rewards)),
-            'std_reward': float(np.std(test_rewards))
-        }
-        
-        if best_objectives:
-            results.update({
-                'total_value': float(best_objectives['value']),
-                'selected_items': int(best_objectives['n_selected'])
-            })
-            for name in ('weight', 'volume', 'cost'):
-                if name in best_objectives:
-                    results[f'total_{name}'] = float(best_objectives[name])
-        
-        # 添加可视化处理
-        if visualize and best_objectives:
-            try:
-                # 创建solutions目录
-                os.makedirs('solutions', exist_ok=True)
-                
-                # 准备可视化所需数据
-                visualizer = ProblemVisualizer(use_english_labels=True)  # 强制使用英文标签，避免中文字体问题
-                
-                # 获取环境的当前状态
-                state = self.env.reset()
-                for action in best_solution:
-                    state, _, _, _ = self.env.step(action)
-                
-                # 从state中构建问题实例
-                problem_data = {}
-                
-                if isinstance(self.env, KnapsackEnv):
-                    # 获取实际目标名称和约束
-                    objective_names = self.env.objective_names
-                    # 构建容量字典，将每个约束与其名称关联
-                    capacities = {
-                        f"{name}_capacity": capacity
-                        for name, capacity in zip(objective_names, self.env.capacities)
-                        if np.isfinite(capacity)
-                    }
-
-                    problem_data = {
-                        'items': self.env.problem.items.reshape(-1, self.env.num_objectives),
-                        'objective_names': objective_names,
-                        'objective_types': self.config.get('model', {}).get('objective_types',
-                                          [1] + [-1] * (len(objective_names) - 1))
-                    }
-                    
-                    # 添加所有容量约束
-                    problem_data.update(capacities)
-                
-                # 提取所有解的目标值
-                # 确保支持动态数量的目标函数
-                num_objectives = len(self.env.current_objectives)
-                all_objectives = []
-                
-                for obj in objectives_list:
-                    obj_values = []
-                    # 从环境中获取所有目标名称
-                    for i, name in enumerate(self.env.objective_names):
-                        name_lower = name.lower()
-                        # 尝试使用目标名称获取值
-                        if name_lower in obj:
-                            obj_values.append(obj[name_lower])
-                        # 尝试使用通用名称获取值
-                        elif i == 0 and 'value' in obj:
-                            obj_values.append(obj['value'])
-                        elif i == 1 and 'weight' in obj:
-                            obj_values.append(obj['weight'])
-                        elif i == 2 and 'volume' in obj:
-                            obj_values.append(obj['volume'])
-                        elif i == 3 and 'cost' in obj:
-                            obj_values.append(obj['cost'])
-                        elif i == 4 and 'time' in obj:
-                            obj_values.append(obj['time'])
-                        else:
-                            # 对于额外的目标，如果没有具体名称，使用索引
-                            obj_key = f'objective_{i}'
-                            if obj_key in obj:
-                                obj_values.append(obj[obj_key])
-                            else:
-                                obj_values.append(0)  # 默认值
-                    
-                    # 确保目标值数量与目标数量匹配
-                    while len(obj_values) < num_objectives:
-                        obj_values.append(0)  # 添加默认值
-                    
-                    all_objectives.append(obj_values[:num_objectives])  # 只保留需要的目标数量
-                
-                if all_objectives:
-                    all_objectives = np.array(all_objectives)
-                    
-                    # 添加当前解
-                    solution_obj = []
-                    for i in range(num_objectives):
-                        if i < len(self.env.current_objectives):
-                            solution_obj.append(self.env.current_objectives[i])
-                        else:
-                            solution_obj.append(0)  # 默认值
-                    
-                    solution_obj = np.array(solution_obj)
-                    all_objectives = np.vstack([all_objectives, solution_obj])
-                    
-                    # 可视化Pareto前沿
-                    visualizer.visualize_pareto_front(all_objectives)
-                    
-                    # 高维可视化
-                    if num_objectives > 3:
-                        try:
-                            visualizer.visualize_high_dimensional_solution(
-                                problem={
-                                    'items': problem_data.get('items', self.env.problem.items) if hasattr(self.env, 'problem') else [],  # 正确传递物品数据
-                                    'objective_names': self.env.objective_names if hasattr(self.env, 'objective_names') else None,
-                                    'objective_types': self.env.problem.objective_types if hasattr(self.env.problem, 'objective_types') else None
-                                },
-                                solution=np.array(best_solution, dtype=np.int32),  # 使用已转换的best_solution
-                                objectives=np.array(all_objectives)
-                            )
-                        except Exception as e:
-                            logging.error(f"高维可视化失败: {e}")
-                    else:
-                        try:
-                            visualizer.visualize_problem_and_solution(problem_data, best_solution)
-                        except Exception as e:
-                            logging.error(f"问题可视化失败: {e}")
-                    
-                    logging.info("可视化结果已保存到 solutions 目录")
-            except Exception as e:
-                logging.error(f"生成可视化时出错: {str(e)}")
-        
-        return results, best_solution, best_objectives
-
-    def _tsp_test_results(self, solutions, objectives, rewards, visualize):
+    def _candidate_test_results(self, solutions, objectives, rewards, is_tsp, visualize):
+        problem = self.env.problem
         names = self.env.objective_names
-        directions = self.env.objective_types
+        if is_tsp:
+            directions = self.env.objective_types
+        else:
+            configured = self.config['problem'].get('objective_types')
+            if configured is None:
+                configured = self.config.get('model', {}).get('objective_types')
+            directions = list(configured or [])[:len(names)]
+            defaults = [1] + [-1] * (len(names) - 1)
+            directions.extend(defaults[len(directions):])
+
         first_index = {}
-        for index, tour in enumerate(solutions):
-            first_index.setdefault(tuple(tour), index)
-        unique_tours = list(first_index)
-        objective_values = np.asarray([objectives[index] for index in first_index.values()])
-        frontier = nondominated_mask(objective_values, directions)
-        best_index = max(np.flatnonzero(frontier), key=lambda index: rewards[first_index[unique_tours[index]]])
-        best_tour = list(unique_tours[best_index])
-        best_objectives = dict(zip(names, objective_values[best_index].tolist()))
+        for index, solution in enumerate(solutions):
+            first_index.setdefault(tuple(solution), index)
+        candidates = list(first_index)
+        values = np.asarray([objectives[index] for index in first_index.values()])
+        frontier = nondominated_mask(values, directions)
+        best_index = int(max(np.flatnonzero(frontier), key=lambda i: rewards[first_index[candidates[i]]]))
+        best_solution = list(candidates[best_index])
+        best_values = values[best_index].tolist()
+        best_objectives = dict(zip(names, best_values))
 
-        for name, value in best_objectives.items():
-            logging.info(f"目标 {name}: {value:.6f}")
-        logging.info(f"TSP 候选路线: {len(unique_tours)} 条，非支配路线: {int(frontier.sum())} 条")
-        if visualize:
-            visualizer = ProblemVisualizer(use_english_labels=True)
-            visualizer.visualize_tsp_solution(self.env.coordinates, best_tour)
-            visualizer.visualize_tsp_pareto(objective_values, names, directions, frontier)
-            with open('solutions/tsp_candidates.json', 'w', encoding='utf-8') as output:
-                json.dump({
-                    'coordinates': self.env.coordinates.tolist(),
-                    'objective_names': names,
-                    'objective_types': directions,
-                    'selected_index': int(best_index),
-                    'candidates': [
-                        {'tour': list(tour), 'objectives': values.tolist(), 'nondominated': bool(on_frontier)}
-                        for tour, values, on_frontier in zip(unique_tours, objective_values, frontier)
-                    ],
-                }, output, ensure_ascii=False, indent=2)
-
+        problem_type = 'tsp' if is_tsp else 'knapsack'
+        solution_key = 'tour' if is_tsp else 'selection'
         results = {
             'mean_reward': float(np.mean(rewards)),
             'std_reward': float(np.std(rewards)),
-            'tour_length': objective_values[best_index, 0].item(),
-            'num_candidates': len(unique_tours),
+            'num_candidates': len(candidates),
             'num_nondominated': int(frontier.sum()),
         }
-        return results, best_tour, best_objectives
+        for name, value in best_objectives.items():
+            logging.info(f"目标 {name}: {value:.6f}")
+        logging.info(f"{problem_type} 候选解: {len(candidates)} 个，非支配解: {int(frontier.sum())} 个")
+
+        if visualize:
+            visualizer = ProblemVisualizer(use_english_labels=True)
+            if is_tsp:
+                visualizer.visualize_tsp_solution(self.env.coordinates, best_solution)
+                instance = {'coordinates': self.env.coordinates.tolist()}
+            else:
+                instance = {
+                    'items': problem.items.tolist(),
+                    'capacities': [float(limit) if np.isfinite(limit) else None for limit in problem.capacities],
+                }
+            visualizer.visualize_candidate_pareto(values, names, directions, frontier, problem_type)
+            with open(f'solutions/{problem_type}_candidates.json', 'w', encoding='utf-8') as output:
+                json.dump({
+                    **instance,
+                    'objective_names': names,
+                    'objective_types': directions,
+                    'selected_index': best_index,
+                    'candidates': [
+                        {solution_key: list(solution), 'objectives': row.tolist(), 'nondominated': bool(on_frontier)}
+                        for solution, row, on_frontier in zip(candidates, values, frontier)
+                    ],
+                }, output, ensure_ascii=False, indent=2, allow_nan=False)
+
+        if is_tsp:
+            results['tour_length'] = best_values[0]
+        else:
+            best_objectives = {name.lower(): value for name, value in best_objectives.items()}
+            for name, value in zip(('value', 'weight', 'volume', 'cost', 'time'), best_values):
+                best_objectives.setdefault(name, value)
+            best_objectives['n_selected'] = len(best_solution)
+            results['selected_items'] = len(best_solution)
+            for name in ('value', 'weight', 'volume', 'cost'):
+                if name in best_objectives:
+                    results[f'total_{name}'] = best_objectives[name]
+
+        return results, best_solution, best_objectives
 
     def _save_training_losses(self):
         """保存训练损失图表"""

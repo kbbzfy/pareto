@@ -653,9 +653,10 @@ class ProblemVisualizer:
         fig.savefig('solutions/tsp_solution.png')
         plt.close(fig)
 
-    def visualize_tsp_pareto(self, values, names, directions, frontier):
+    def visualize_candidate_pareto(self, values, names, directions, frontier, problem_type):
         """Plot pairwise projections of the candidate frontier calculated in all dimensions."""
         translations = {
+            **self.cn_to_en_objectives,
             "总距离": "Total distance", "时间窗口迟到量": "Time-window lateness",
             "路段长度变异系数": "Segment length CV", "最长路段": "Longest segment",
         }
@@ -676,9 +677,10 @@ class ProblemVisualizer:
                 ax.set_yticks([])
             ax.grid(alpha=0.25)
         axes[0, 0].legend()
-        fig.suptitle('TSP candidate Pareto front (all objectives)')
+        title = 'TSP' if problem_type == 'tsp' else 'Knapsack'
+        fig.suptitle(f'{title} candidate Pareto front (all objectives)')
         fig.tight_layout()
-        fig.savefig('solutions/tsp_pareto_front.png')
+        fig.savefig(f'solutions/{problem_type}_pareto_front.png')
         plt.close(fig)
 
     def visualize_high_dimensional_solution(self, problem: Dict, solution: List[int], objectives: np.ndarray):
