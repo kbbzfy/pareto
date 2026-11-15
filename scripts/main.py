@@ -249,16 +249,16 @@ def main():
                     'problem': {
                         'type': 'tsp',
                         'size': config['problem'].get('size', 20),
-                        'num_objectives': config['problem'].get('n_objectives', 4),
+                        'num_objectives': args.n_objectives,
                         'objective_names': config['problem'].get('objective_names', 
                             ["总距离", "时间窗口", "平衡性", "成本"]),
                         'objective_types': config['problem'].get('objective_types', 
-                            [-1] * config['problem'].get('n_objectives', 4))
+                            [-1] * args.n_objectives)
                     },
                     'model': {
                         'objective_names': config.get('model', {}).get('objective_names', []),
                         'objective_types': config.get('model', {}).get('objective_types', 
-                            [-1] * config['problem'].get('n_objectives', 4))
+                            [-1] * args.n_objectives)
                     }
                 }
                 
@@ -352,6 +352,9 @@ def main():
                 if 'error' in results:
                     logging.error(f"测试过程出错: {results['error']}")
                 else:
+                    if 'tour_length' in results:
+                        logging.info(f"TSP 路线长度: {results['tour_length']:.6f}")
+                        logging.info(f"闭合路线: {solution}")
                     if 'total_value' in results:
                         logging.info(f"总价值: {results['total_value']:.2f}")
                     if 'total_weight' in results:

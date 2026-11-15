@@ -22,7 +22,8 @@ class TSPProblem(BaseProblem):
         self.distance_matrix = None
         
         # 从配置获取目标数量
-        self.num_objectives = config.get('problem', {}).get('n_objectives', 3)
+        problem_config = config.get('problem', {})
+        self.num_objectives = problem_config.get('num_objectives', problem_config.get('n_objectives', 3))
         
         # 从配置获取目标名称
         self.objective_names = config.get('problem', {}).get('objective_names', 
@@ -37,9 +38,12 @@ class TSPProblem(BaseProblem):
         if size is not None:
             self.dimension = size
         
+        if self.dimension < 2:
+            raise ValueError("TSP 至少需要两个城市")
+
         # 生成更有意义的城市分布
         # 使用聚类方式生成城市，更接近实际情况
-        num_clusters = min(4, self.dimension // 5)  # 城市群的数量
+        num_clusters = max(1, min(4, self.dimension // 5))  # 城市群的数量
         cluster_centers = np.random.uniform(0.2, 0.8, size=(num_clusters, 2))
         
         coordinates = []
@@ -171,7 +175,7 @@ class TSPProblem(BaseProblem):
             return False
         # 检查是否访问了所有城市恰好一次
         visited = set(solution[:-1])  # 不包括最后回到起点
-        return len(visited) == self.dimension and solution[0] == solution[-1]
+        return visited == set(range(self.dimension)) and solution[0] == solution[-1]
         
     def get_initial_state(self):
         """获取初始状态"""

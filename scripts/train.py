@@ -1150,8 +1150,11 @@ class RLTrainer:
                 except Exception as e:
                     logger.error(f"第 {episode+1} 轮训练出错: {str(e)}")
                     logger.error(traceback.format_exc())
-                    continue
+                    raise
             
+            if not self.policy_losses:
+                raise RuntimeError("没有进行参数更新，请增加训练回合数或减小批次大小")
+
             # 保存最终模型
             try:
                 self._save_checkpoint()
@@ -1182,9 +1185,13 @@ class RLTrainer:
             raise
 
     def _action_distribution(self, action_probs, states):
-        if isinstance(self.env, KnapsackEnv):
+        if isinstance(self.env, (KnapsackEnv, TSPEnv)):
+            if isinstance(self.env, TSPEnv):
+                valid_actions = np.stack([state['visited_mask'] == 0 for state in states])
+            else:
+                valid_actions = np.stack([state['action_mask'] for state in states])
             masks = torch.as_tensor(
-                np.stack([state['action_mask'] for state in states]),
+                valid_actions,
                 dtype=torch.bool,
                 device=action_probs.device,
             )
@@ -1247,93 +1254,19 @@ class RLTrainer:
         return current_items.unsqueeze(0).to(self.device)
 
     def _process_tsp_state(self, state):
-        """处理TSP问题的状态"""
-        try:
-            coordinates = np.array(state['coordinates'])
-            current_pos = state['current_pos']
-            visited_mask = np.array(state['visited_mask'])
-            distance_matrix = np.array(state['distance_matrix'])
-            
-            # 获取当前城市的坐标
-            current_coords = coordinates[current_pos]
-            
-            # 对未访问城市创建特征矩阵
-            unvisited_indices = np.where(visited_mask == 0)[0]
-            
-            # 记录当前回合的状态信息（仅在调试级别）
-            if logging.getLogger().level <= logging.DEBUG:
-                logging.debug(f"当前位置: {current_pos}, 未访问城市数: {len(unvisited_indices)}")
-                logging.debug(f"未访问城市索引: {unvisited_indices}")
-            
-            # 如果所有城市都已访问，返回一个特殊的"全部完成"状态表示
-            if len(unvisited_indices) == 0:
-                n_features = self.config['model'].get('input_dim', 4)
-                # 返回一个单行特征向量，表示所有城市已访问
-                final_state = torch.zeros(1, 1, n_features).to(self.device)
-                # 设置一个特殊标志，表示完成状态
-                final_state[0, 0, 0] = 1.0  # 第一个特征设为1，表示完成
-                return final_state
-            
-            # 为每个未访问城市创建特征向量
-            features_list = []
-            for idx in unvisited_indices:
-                # 计算相对坐标 (相对于当前城市的位置)
-                relative_x = coordinates[idx, 0] - current_coords[0]
-                relative_y = coordinates[idx, 1] - current_coords[1]
-                
-                # 计算距离和其他特征
-                distance = distance_matrix[current_pos, idx]
-                visited_ratio = np.sum(visited_mask) / len(visited_mask)
-                
-                # 增加新特征：剩余城市数量和当前步数
-                remaining_cities = len(unvisited_indices) / len(visited_mask)  # 归一化
-                current_steps = np.sum(visited_mask) / len(visited_mask)  # 归一化
-                
-                # 构建特征向量 [x坐标, y坐标, 到当前城市的距离, 已访问比例, 剩余城市比例, 当前步数比例]
-                feature = [
-                    relative_x,
-                    relative_y,
-                    distance,
-                    visited_ratio,
-                    remaining_cities,
-                    current_steps
-                ]
-                
-                # 确保特征向量的长度与模型输入维度一致
-                expected_dim = self.config['model'].get('input_dim', 4)
-                if len(feature) < expected_dim:
-                    # 如果特征数量不足，填充零
-                    feature.extend([0.0] * (expected_dim - len(feature)))
-                elif len(feature) > expected_dim:
-                    # 如果特征数量过多，截断
-                    feature = feature[:expected_dim]
-                
-                features_list.append(feature)
-            
-            # 转换为张量
-            features = torch.tensor(features_list, dtype=torch.float32)
-            
-            # 添加批次维度并返回 [1, num_features, n_dims]
-            state_tensor = features.unsqueeze(0).to(self.device)
-            
-            # 保存有效动作信息到模型，这样预测时可以使用
-            if hasattr(self, 'model') and hasattr(self.model, 'set_mask'):
-                # 创建城市掩码，将已访问的城市标记为True（掩码）
-                mask = torch.ones(1, len(coordinates), dtype=torch.bool).to(self.device)
-                # 将未访问的城市设置为False（可用）
-                for idx in unvisited_indices:
-                    mask[0, idx] = False
-                # 设置模型的动作掩码
-                self.model.set_mask(mask)
-                
-            return state_tensor
-            
-        except Exception as e:
-            self.logger.error(f"处理TSP状态时出错: {str(e)}")
-            import traceback
-            self.logger.error(traceback.format_exc())
-            # 返回一个安全的默认张量
-            return torch.zeros(1, 1, self.config['model'].get('input_dim', 4)).to(self.device)
+        """每一行始终对应原始城市 ID，访问掩码在选择动作时应用。"""
+        coordinates = state['coordinates']
+        current_pos = state['current_pos']
+        visited_ratio = state['visited_mask'].mean()
+        features = np.column_stack((
+            coordinates - coordinates[current_pos],
+            state['distance_matrix'][current_pos],
+            np.full(len(coordinates), visited_ratio),
+            np.full(len(coordinates), 1.0 - visited_ratio),
+            np.full(len(coordinates), visited_ratio),
+        ))
+        state_tensor = torch.as_tensor(features, dtype=torch.float32, device=self.device)
+        return self._adjust_features(state_tensor.unsqueeze(0), self.input_dim)
 
     def _handle_episode_end(self, episode, episode_reward, info):
         """处理回合结束"""
@@ -1433,46 +1366,9 @@ class RLTrainer:
             action_probs, state_values, _ = self.model(states_batch)
             self.logger.info(f"模型前向传播成功，动作概率形状: {action_probs.shape}, 状态值形状: {state_values.shape}")
             
-            # 计算策略损失 (Actor)
-            # 在TSP问题中，动作索引可能会超出范围，需要特殊处理
-            if isinstance(self.env, KnapsackEnv):
-                distribution = self._action_distribution(action_probs, states)
-                action_probs = distribution.probs
-            log_probs = torch.log(action_probs + 1e-10)
-            
-            # 确保动作索引在有效范围内
-            max_action_idx = action_probs.size(1) - 1
-            valid_actions = []
-            
-            # 优化TSP问题的动作索引处理
-            if self.config['problem']['type'] == 'tsp':
-                # 对于TSP问题，我们需要特殊处理动作索引
-                # 因为随着城市被访问，可选动作数量会减少
-                for i, action in enumerate(actions_batch):
-                    if action > max_action_idx:
-                        # 如果动作索引超出范围，检查是否有其他有效动作
-                        self.logger.warning(f"动作索引 {action.item()} 超出范围 [0, {max_action_idx}]")
-                        # 将超出范围的动作转换为有效范围内的随机动作
-                        valid_action = torch.randint(0, max_action_idx + 1, (1,)).item()
-                        self.logger.info(f"替换为随机有效动作: {valid_action}")
-                        valid_actions.append(valid_action)
-                    else:
-                        valid_actions.append(action.item())
-            else:
-                # 对于背包问题，保持原有处理方式
-                for i, action in enumerate(actions_batch):
-                    if action > max_action_idx:
-                        # 如果动作索引超出范围，裁剪并记录
-                        self.logger.warning(f"动作索引 {action.item()} 被裁剪为 {max_action_idx}")
-                        valid_actions.append(max_action_idx)
-                    else:
-                        valid_actions.append(action.item())
-            
-            valid_actions_batch = torch.tensor(valid_actions, dtype=torch.int64).to(self.device)
-            
-            # 使用有效动作索引计算策略损失
-            selected_log_probs = log_probs.gather(1, valid_actions_batch.unsqueeze(1))
-            
+            distribution = self._action_distribution(action_probs, states)
+            selected_log_probs = distribution.log_prob(actions_batch).unsqueeze(1)
+
             # 获取下一个状态的价值 - 同样处理三个返回值
             _, next_state_values, _ = self.model(next_states_batch)
             next_state_values = next_state_values.detach()
@@ -1490,10 +1386,12 @@ class RLTrainer:
             policy_loss = -(selected_log_probs * advantage).mean()
             
             # 熵损失 (用于鼓励探索)
-            entropy = -(action_probs * log_probs).sum(dim=1).mean()
+            entropy = distribution.entropy().mean()
             
             # 总损失
             loss = policy_loss + self.value_weight * value_loss - self.entropy_weight * entropy
+            if not torch.isfinite(loss).item():
+                raise RuntimeError("强化学习损失出现非有限值")
             
             # 优化
             self.optimizer.zero_grad()
@@ -1525,6 +1423,7 @@ class RLTrainer:
             self.logger.error(f"更新模型过程中出错: {str(e)}")
             import traceback
             self.logger.error(traceback.format_exc())
+            raise
 
     def _adjust_features(self, tensor, target_dim):
         """调整特征维度以匹配目标维度"""
@@ -1639,12 +1538,13 @@ class RLTrainer:
     def test(self, visualize=False):
         """测试模型"""
         self.model.eval()
+        is_tsp = isinstance(self.env, TSPEnv)
         test_rewards = []
         solutions = []
         objectives_list = []
         
         for episode in range(10):  # 测试10个episode
-            state = self.env.reset()
+            state = self.env.reset(regenerate=False) if is_tsp else self.env.reset()
             done = False
             episode_reward = 0
             current_solution = []
@@ -1671,6 +1571,11 @@ class RLTrainer:
                 not info['feasible'] or not self.env.problem.is_feasible(current_solution)
             ):
                 continue
+
+            if is_tsp:
+                current_solution = info['tour']
+                if not self.env.problem.is_feasible(current_solution):
+                    raise ValueError("TSP 模型未返回完整闭合路线")
 
             test_rewards.append(episode_reward)
             solutions.append(current_solution)
@@ -1708,6 +1613,8 @@ class RLTrainer:
                             logging.info(f"目标{i} ({name})容量: {self.env.capacities[i]}")
                 
                 objectives_list.append(objectives)
+            elif is_tsp:
+                objectives_list.append(dict(zip(self.env.objective_names, info['objectives'])))
         
         if not solutions:
             raise ValueError("模型未找到满足背包容量上限的完整选择")
@@ -1722,6 +1629,16 @@ class RLTrainer:
             'std_reward': float(np.std(test_rewards))
         }
         
+        if is_tsp:
+            results['tour_length'] = float(self.env.problem._compute_tour_length(best_solution))
+            for name, value in best_objectives.items():
+                logging.info(f"目标 {name}: {value:.6f}")
+            if visualize:
+                ProblemVisualizer(use_english_labels=True).visualize_tsp_solution(
+                    self.env.coordinates, best_solution
+                )
+            return results, best_solution, best_objectives
+
         if best_objectives:
             results.update({
                 'total_value': float(best_objectives['value']),
@@ -1738,7 +1655,6 @@ class RLTrainer:
                 os.makedirs('solutions', exist_ok=True)
                 
                 # 准备可视化所需数据
-                from src.utils.visualization import ProblemVisualizer
                 visualizer = ProblemVisualizer(use_english_labels=True)  # 强制使用英文标签，避免中文字体问题
                 
                 # 获取环境的当前状态

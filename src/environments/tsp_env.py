@@ -14,7 +14,9 @@ class TSPEnv(BaseEnv):
         
         # 确保在使用前设置size
         instance = problem.generate_instance(problem.dimension)
-        self.size = len(instance['coordinates'])
+        self.coordinates = instance['coordinates']
+        self.distance_matrix = instance['distance_matrix']
+        self.size = len(self.coordinates)
         
         # 从问题获取目标名称和类型
         self.num_objectives = getattr(problem, 'num_objectives', 4)  # 默认4个目标
@@ -51,15 +53,15 @@ class TSPEnv(BaseEnv):
             'distance_matrix': spaces.Box(low=0, high=np.inf, shape=(self.size, self.size), dtype=np.float32)
         })
         
-        self.reset()
-        
-    def reset(self):
-        """重置环境到初始状态"""
-        # 获取问题实例数据
-        instance = self.problem.generate_instance(self.size)
-        self.coordinates = instance['coordinates']
-        self.distance_matrix = instance['distance_matrix']
-        
+        self.reset(regenerate=False)
+
+    def reset(self, regenerate=True):
+        """重置回合，可保留城市实例用于同一问题的多次评估。"""
+        if regenerate:
+            instance = self.problem.generate_instance(self.size)
+            self.coordinates = instance['coordinates']
+            self.distance_matrix = instance['distance_matrix']
+
         # 初始化状态
         self.visited = np.zeros(self.size, dtype=np.int32)
         self.tour = []
@@ -75,27 +77,11 @@ class TSPEnv(BaseEnv):
         
     def step(self, action):
         """执行动作"""
+        if not isinstance(action, (int, np.integer)) or action not in self.get_valid_actions():
+            raise ValueError(f"无效的 TSP 城市 ID: {action}")
+
         self.episode_steps += 1
-        
-        # 获取有效动作列表
-        valid_actions = self.get_valid_actions()
-        
-        # 检查动作是否有效
-        if action not in valid_actions:
-            # 动作无效，返回负面奖励但不终止回合
-            self.logger.warning(f"无效动作: {action}，有效动作: {valid_actions}")
-            
-            # 如果允许，自动选择一个有效动作继续
-            if len(valid_actions) > 0:
-                # 自动选择一个有效动作（增加随机性以促进探索）
-                action = np.random.choice(valid_actions)
-                self.logger.info(f"自动选择有效动作: {action}")
-            else:
-                # 没有有效动作，终止回合
-                # 注意：这种情况通常只在所有城市都已访问后发生
-                self.logger.warning("没有有效动作可选，终止回合")
-                return self.get_state_representation(), -1.0, True, {'invalid_action': True, 'message': '无可用动作'}
-        
+
         # 更新状态
         current_city = self.tour[-1]
         distance = self.distance_matrix[current_city][action]
@@ -105,6 +91,7 @@ class TSPEnv(BaseEnv):
         # 判断是否完成
         done = len(self.tour) == self.size
         
+        info = {}
         if done:
             # 添加回到起点的路径
             self.tour.append(self.tour[0])
@@ -112,6 +99,7 @@ class TSPEnv(BaseEnv):
             objectives = self.problem.compute_objectives(np.array(self.tour))
             # 基于多目标计算奖励
             reward = self.compute_reward(objectives)
+            info = {"tour": self.tour.copy(), "objectives": objectives}
             # 记录完成路径的总长度和目标值
             self.logger.info(f"回合完成：总步数={self.episode_steps}, 路径长度={len(self.tour)}, 目标值={objectives}")
         else:
@@ -131,14 +119,14 @@ class TSPEnv(BaseEnv):
             reward = -distance * weight / (remaining_cities * smooth_factor)
             
         self.episode_rewards.append(reward)
-        return self.get_state_representation(), reward, done, {}
+        return self.get_state_representation(), reward, done, info
         
     def get_state_representation(self):
         """获取状态表示"""
         return {
             'coordinates': self.coordinates.astype(np.float32),
             'current_pos': self.tour[-1],
-            'visited_mask': self.visited,
+            'visited_mask': self.visited.copy(),
             'distance_matrix': self.distance_matrix.astype(np.float32)
         }
         
@@ -198,7 +186,7 @@ class TSPEnv(BaseEnv):
             reward += normalized_value * weight
         
         # 改进的进度奖励（考虑规模因素）
-        if len(self.tour) == self.size:
+        if len(self.tour) == self.size + 1:
             reward += 1.0 * scale_factor  # 完成路径的额外奖励
         
         return reward / scale_factor  # 最终归一化
