@@ -1,0 +1,64 @@
+# 优化后的TSP问题配置文件
+
+problem:
+  type: tsp                # 问题类型为TSP
+  size: 20                 # 城市数量
+  n_objectives: 4          # 目标函数数量
+  objective_names:         # 目标函数名称
+    - "总距离"
+    - "时间窗口"
+    - "平衡性"
+    - "成本"
+  objective_types:         # 目标类型 (-1:最小化, 1:最大化)
+    - -1
+    - -1
+    - -1
+    - -1
+
+model:
+  n_objectives: 4          # 目标数量
+  hidden_dim: 256          # 隐藏层维度
+  batch_size: 64           # 批次大小
+  learning_rate: 0.0005    # 学习率
+  epochs: 100              # 训练轮次
+  dropout_rate: 0.1        # Dropout率
+  input_dim: 6             # 增加TSP输入特征维度 [x, y, 距离, 访问比例, 剩余城市, 当前步数]
+  max_cities: 20           # 最大城市数，用于掩码处理
+
+data:
+  train_dir: "data/tsp/train"  # 训练数据目录
+  val_dir: "data/tsp/val"      # 验证数据目录
+  test_dir: "data/tsp/test"    # 测试数据目录
+  train_size: 1000             # 训练集大小
+  val_size: 200                # 验证集大小
+  test_size: 100               # 测试集大小
+  num_workers: 4               # 数据加载线程数
+
+training:
+  num_episodes: 5000           # 增加训练回合数以获得更好的收敛
+  max_steps: 100               # 每回合最大步数
+  learning_rate: 0.0003        # 降低学习率以提高稳定性
+  gamma: 0.99                  # 折扣因子
+  update_freq: 1               # 模型更新频率
+  batch_size: 128              # 增加批次大小以减少方差
+  buffer_size: 100000          # 增加经验回放缓冲区大小
+  epsilon_start: 1.0           # 初始探索率
+  epsilon_end: 0.01            # 最终探索率
+  epsilon_decay: 0.995         # 探索率衰减（更慢的衰减）
+  entropy_weight: 0.02         # 增加熵权重以促进探索
+  value_weight: 0.5            # 价值函数权重
+  checkpoint_dir: "checkpoints/tsp"  # 检查点保存目录
+  save_interval: 100           # 模型保存间隔
+  log_interval: 10             # 日志打印间隔
+  eval_interval: 100           # 评估间隔
+  early_stopping: true         # 启用早停
+  patience: 30                 # 增加早停耐心值
+  gradient_clip: 1.0           # 梯度裁剪值
+  lr_decay: true               # 启用学习率衰减
+  lr_decay_step: 500           # 学习率衰减步长
+  lr_decay_rate: 0.95          # 学习率衰减率
+
+visualization:
+  use_english_labels: true     # 使用英文标签
+  style: "seaborn-v0_8-whitegrid"  # 图表样式
+  dpi: 150                     # 图像DPI 
