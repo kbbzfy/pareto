@@ -107,63 +107,18 @@ def generate_knapsack_instance(config):
 
 def generate_tsp_instance(config):
     """生成TSP问题实例"""
-    try:
-        # 获取城市数量
-        size = config['problem'].get('size', 20)
-        
-        # 获取目标数量
-        num_objectives = config['problem'].get('num_objectives', 
-                                             config['problem'].get('n_objectives', 3))
-        
-        # 获取目标名称
-        default_names = ["总距离", "时间窗口", "平衡性", "最大段长", "其他目标"]
-        objective_names = config['problem'].get('objective_names', 
-                                               default_names[:num_objectives])
-        
-        # 确保目标名称数量匹配
-        while len(objective_names) < num_objectives:
-            objective_names.append(f"目标{len(objective_names)+1}")
-        
-        # 获取目标类型
-        default_types = [-1] * num_objectives  # 默认全部最小化
-        objective_types = config['problem'].get('objective_types', default_types)
-        
-        # 确保目标类型数量匹配
-        while len(objective_types) < num_objectives:
-            objective_types.append(-1)  # 默认添加最小化目标
-        
-        print(f"生成TSP问题实例：")
-        print(f"  城市数量: {size}")
-        print(f"  目标数量: {num_objectives}")
-        print(f"  目标名称: {objective_names}")
-        print(f"  目标类型: {objective_types}")
-        
-    except KeyError as e:
-        print(f"配置缺少必要的键: {e}")
-        # 使用默认值
-        size = 20
-        num_objectives = 3
-        objective_names = ["总距离", "时间窗口", "平衡性"]
-        objective_types = [-1, -1, -1]
-        print(f"使用默认配置生成实例")
-    
-    # 创建TSP问题实例
-    tsp_problem = problem_factory.create_problem('tsp', config)
-    
-    # 生成问题实例
-    instance = tsp_problem.generate_instance(size)
-    
-    # 创建数据字典
+    problem = problem_factory.create_problem('tsp', config)
+    instance = problem.generate_instance()
     data = {
         'coordinates': instance['coordinates'].tolist(),
         'distance_matrix': instance['distance_matrix'].tolist(),
         'nearest_neighbor_tour': instance['nearest_neighbor_tour'].tolist(),
-        'objective_names': objective_names,
-        'objective_types': objective_types,
-        'num_objectives': num_objectives,
-        'size': size
+        'objective_names': problem.objective_names,
+        'objective_types': problem.objective_types,
+        'num_objectives': problem.num_objectives,
+        'size': problem.dimension,
     }
-    
+
     return data
 
 def generate_dataset(problem_type, config, split='train'):

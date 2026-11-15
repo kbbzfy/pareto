@@ -2,6 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from typing import List, Dict
 import json
+from itertools import combinations
 import os
 import pandas as pd
 from pandas.plotting import parallel_coordinates
@@ -110,7 +111,7 @@ class ProblemVisualizer:
         self.use_english_labels = use_english_labels
         
         # 下载并安装中文字体
-        self.chinese_fonts = download_and_install_fonts()
+        self.chinese_fonts = [] if use_english_labels else download_and_install_fonts()
         
         # 设置matplotlib支持中文显示
         self._setup_matplotlib_fonts()
@@ -638,98 +639,49 @@ class ProblemVisualizer:
         plt.close()
 
     def visualize_tsp_solution(self, coordinates: np.ndarray, solution: List[int]):
-        """可视化TSP问题的解决方案"""
-        fig = plt.figure(figsize=(15, 6))
-        
-        # 1. 2D路径图
-        ax1 = fig.add_subplot(121)
-        
-        # 绘制城市点
-        ax1.scatter(coordinates[:, 0], coordinates[:, 1], c='blue', s=100, label='Cities')
-        
-        # 绘制路径
-        for i in range(len(solution)-1):
-            start = coordinates[solution[i]]
-            end = coordinates[solution[i+1]]
-            ax1.plot([start[0], end[0]], [start[1], end[1]], 'r-', alpha=0.6)
-        
-        # 标记起点（最佳解的起始城市）
-        start_city = coordinates[solution[0]]
-        ax1.scatter([start_city[0]], [start_city[1]], c='red', s=200, marker='*', 
-                    label='Start City', zorder=5)
-        
-        ax1.set_title('TSP Solution Path')
-        ax1.legend()
-        ax1.grid(True)
-        
-        # 2. 3D Pareto前沿图
-        ax2 = fig.add_subplot(122, projection='3d')
-        
-        # 生成更有意义的变体解
-        n_variations = 50
-        objectives_list = []
-        
-        # 计算当前解的目标值
-        current_objectives = self._compute_tsp_objectives(coordinates, solution)
-        objectives_list.append(current_objectives)
-        
-        # 生成变体并计算目标值
-        for _ in range(n_variations):
-            # 使用2-opt局部搜索生成变体
-            i, j = np.random.choice(len(solution)-1, 2, replace=False)
-            if i > j:
-                i, j = j, i
-            variation = solution.copy()
-            variation[i:j+1] = variation[i:j+1][::-1]  # 反转子路径
-            
-            objectives = self._compute_tsp_objectives(coordinates, variation)
-            objectives_list.append(objectives)
-        
-        # 转换为numpy数组并绘制
-        objectives = np.array(objectives_list)
-        ranks = self._compute_pareto_ranks(objectives)
-        
-        scatter = ax2.scatter(
-            objectives[:, 0],  # 总距离
-            objectives[:, 1],  # 时间窗口违反
-            objectives[:, 2],  # 路径平衡性
-            c=ranks,
-            cmap='viridis'
-        )
-        
-        # 标记当前解
-        ax2.scatter([current_objectives[0]], 
-                    [current_objectives[1]], 
-                    [current_objectives[2]], 
-                    c='red', marker='*', s=200, label='Current Solution')
-        
-        ax2.set_xlabel('Total Distance')
-        ax2.set_ylabel('Time Window Violations')
-        ax2.set_zlabel('Route Balance (CV)')
-        ax2.set_title('3D Pareto Front')
-        plt.colorbar(scatter, label='Pareto Rank')
-        ax2.legend()
-        
-        plt.tight_layout()
-        plt.savefig('solutions/tsp_solution.png')
-        plt.show()
-        plt.close()
+        """绘制求解器返回的闭合路线。"""
+        fig, ax = plt.subplots(figsize=(8, 6))
+        route = coordinates[np.asarray(solution)]
+        ax.plot(route[:, 0], route[:, 1], color='tab:red', alpha=0.65, label='Tour')
+        ax.scatter(coordinates[:, 0], coordinates[:, 1], color='tab:blue', label='Cities')
+        ax.scatter(*route[0], color='tab:red', s=120, marker='*', label='Start city')
+        ax.set_title('TSP Solution Path')
+        ax.set_aspect('equal')
+        ax.legend()
+        ax.grid(True)
+        fig.tight_layout()
+        fig.savefig('solutions/tsp_solution.png')
+        plt.close(fig)
 
-    def _compute_tsp_objectives(self, coordinates: np.ndarray, solution: List[int]) -> np.ndarray:
-        """计算TSP问题的三个目标值"""
-        # 1. 总距离
-        total_dist = sum(np.linalg.norm(coordinates[solution[i]] - coordinates[solution[i+1]])
-                        for i in range(len(solution)-1))
-        
-        # 2. 时间窗口违反（使用距离作为时间估计）
-        time_penalty = np.random.uniform(0, total_dist * 0.2)
-        
-        # 3. 路径平衡性（使用相邻段距离的变异系数）
-        segments = [np.linalg.norm(coordinates[solution[i]] - coordinates[solution[i+1]])
-                   for i in range(len(solution)-1)]
-        balance = np.std(segments) / np.mean(segments) if segments else 0
-        
-        return np.array([total_dist, time_penalty, balance])
+    def visualize_candidate_pareto(self, values, names, directions, frontier, problem_type):
+        """Plot pairwise projections of the candidate frontier calculated in all dimensions."""
+        translations = {
+            **self.cn_to_en_objectives,
+            "总距离": "Total distance", "时间窗口迟到量": "Time-window lateness",
+            "路段长度变异系数": "Segment length CV", "最长路段": "Longest segment",
+        }
+        labels = [f"{translations.get(name, name)} ({'max' if direction == 1 else 'min'})"
+                  for name, direction in zip(names, directions)]
+        pairs = list(combinations(range(len(names)), 2)) or [(0, None)]
+        cols = min(3, len(pairs))
+        rows = (len(pairs) + cols - 1) // cols
+        fig, axes = plt.subplots(rows, cols, squeeze=False, figsize=(4.2 * cols, 3.4 * rows))
+        for ax, (x_index, y_index) in zip(axes.flat, pairs):
+            y_values = values[:, y_index] if y_index is not None else np.zeros(len(values))
+            ax.scatter(values[~frontier, x_index], y_values[~frontier], color='0.65', label='Dominated')
+            ax.scatter(values[frontier, x_index], y_values[frontier], color='tab:blue', label='Nondominated')
+            ax.set_xlabel(labels[x_index])
+            if y_index is not None:
+                ax.set_ylabel(labels[y_index])
+            else:
+                ax.set_yticks([])
+            ax.grid(alpha=0.25)
+        axes[0, 0].legend()
+        title = 'TSP' if problem_type == 'tsp' else 'Knapsack'
+        fig.suptitle(f'{title} candidate Pareto front (all objectives)')
+        fig.tight_layout()
+        fig.savefig(f'solutions/{problem_type}_pareto_front.png')
+        plt.close(fig)
 
     def visualize_high_dimensional_solution(self, problem: Dict, solution: List[int], objectives: np.ndarray):
         """Visualize high-dimensional solution with analysis

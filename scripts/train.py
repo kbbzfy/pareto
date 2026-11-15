@@ -16,6 +16,7 @@ from src.environments.knapsack_env import KnapsackEnv
 from src.environments.tsp_env import TSPEnv
 from src.utils.replay_buffer import ReplayBuffer, Experience
 from src.utils.visualization import ProblemVisualizer
+from src.utils.pareto import nondominated_mask
 from collections import namedtuple
 import time
 import torch.nn.functional as F
@@ -741,8 +742,8 @@ class Trainer:
                 for i, name in enumerate(self.env.objective_names):
                     if i < len(self.env.current_objectives):
                         logging.info(f"目标{i} ({name})值: {self.env.current_objectives[i]}")
-                        if i > 0 and i-1 < len(self.env.capacities):
-                            logging.info(f"目标{i} ({name})容量: {self.env.capacities[i-1]}")
+                        if i < len(self.env.capacities):
+                            logging.info(f"目标{i} ({name})容量: {self.env.capacities[i]}")
                 
                 objectives_list.append(objectives)
         
@@ -788,10 +789,10 @@ class Trainer:
                     objective_names = self.env.objective_names
                     # 构建容量字典，将每个约束与其名称关联
                     capacities = {}
-                    for i in range(1, len(self.env.objective_names)):  # 从1开始，跳过价值目标
-                        if i-1 < len(self.env.capacities):
+                    for i in range(len(self.env.objective_names)):
+                        if i < len(self.env.capacities):
                             name = self.env.objective_names[i]
-                            capacities[f"{name}_capacity"] = self.env.capacities[i-1]
+                            capacities[f"{name}_capacity"] = self.env.capacities[i]
                     
                     problem_data = {
                         'items': self.env.problem.items.reshape(-1, self.env.num_objectives),
@@ -981,7 +982,7 @@ class RLTrainer:
         """验证配置参数的完整性"""
         required_params = {
             'training': ['num_episodes', 'buffer_size', 'batch_size', 'gamma', 
-                        'learning_rate', 'entropy_weight', 'value_weight'],
+                        'learning_rate', 'entropy_weight'],
             'model': ['input_dim', 'hidden_dim'],
             'problem': ['type']
         }
@@ -1081,7 +1082,7 @@ class RLTrainer:
                             
                             # 创建动作分布并采样
                             try:
-                                action_dist = torch.distributions.Categorical(action_probs)
+                                action_dist = self._action_distribution(action_probs, [state])
                                 action = action_dist.sample()
                                 logger.debug(f"动作采样成功: {action.item()}")
                             except Exception as e:
@@ -1132,7 +1133,7 @@ class RLTrainer:
                             raise
                     
                     # 定期保存检查点
-                    if (episode + 1) % self.config['training']['save_interval'] == 0:
+                    if (episode + 1) % self.config['training'].get('save_interval', 50) == 0:
                         try:
                             self._save_checkpoint()
                             logger.info(f"保存检查点成功: episode {episode+1}")
@@ -1150,8 +1151,11 @@ class RLTrainer:
                 except Exception as e:
                     logger.error(f"第 {episode+1} 轮训练出错: {str(e)}")
                     logger.error(traceback.format_exc())
-                    continue
+                    raise
             
+            if not self.policy_losses:
+                raise RuntimeError("没有进行参数更新，请增加训练回合数或减小批次大小")
+
             # 保存最终模型
             try:
                 self._save_checkpoint()
@@ -1180,6 +1184,20 @@ class RLTrainer:
             except:
                 logger.error("无法保存错误时的模型状态")
             raise
+
+    def _action_distribution(self, action_probs, states):
+        if isinstance(self.env, (KnapsackEnv, TSPEnv)):
+            if isinstance(self.env, TSPEnv):
+                valid_actions = np.stack([state['visited_mask'] == 0 for state in states])
+            else:
+                valid_actions = np.stack([state['action_mask'] for state in states])
+            masks = torch.as_tensor(
+                valid_actions,
+                dtype=torch.bool,
+                device=action_probs.device,
+            )
+            action_probs = action_probs.masked_fill(~masks, 0.0)
+        return torch.distributions.Categorical(probs=action_probs)
 
     def _process_state(self, state):
         """处理状态为模型输入格式"""
@@ -1237,93 +1255,19 @@ class RLTrainer:
         return current_items.unsqueeze(0).to(self.device)
 
     def _process_tsp_state(self, state):
-        """处理TSP问题的状态"""
-        try:
-            coordinates = np.array(state['coordinates'])
-            current_pos = state['current_pos']
-            visited_mask = np.array(state['visited_mask'])
-            distance_matrix = np.array(state['distance_matrix'])
-            
-            # 获取当前城市的坐标
-            current_coords = coordinates[current_pos]
-            
-            # 对未访问城市创建特征矩阵
-            unvisited_indices = np.where(visited_mask == 0)[0]
-            
-            # 记录当前回合的状态信息（仅在调试级别）
-            if logging.getLogger().level <= logging.DEBUG:
-                logging.debug(f"当前位置: {current_pos}, 未访问城市数: {len(unvisited_indices)}")
-                logging.debug(f"未访问城市索引: {unvisited_indices}")
-            
-            # 如果所有城市都已访问，返回一个特殊的"全部完成"状态表示
-            if len(unvisited_indices) == 0:
-                n_features = self.config['model'].get('input_dim', 4)
-                # 返回一个单行特征向量，表示所有城市已访问
-                final_state = torch.zeros(1, 1, n_features).to(self.device)
-                # 设置一个特殊标志，表示完成状态
-                final_state[0, 0, 0] = 1.0  # 第一个特征设为1，表示完成
-                return final_state
-            
-            # 为每个未访问城市创建特征向量
-            features_list = []
-            for idx in unvisited_indices:
-                # 计算相对坐标 (相对于当前城市的位置)
-                relative_x = coordinates[idx, 0] - current_coords[0]
-                relative_y = coordinates[idx, 1] - current_coords[1]
-                
-                # 计算距离和其他特征
-                distance = distance_matrix[current_pos, idx]
-                visited_ratio = np.sum(visited_mask) / len(visited_mask)
-                
-                # 增加新特征：剩余城市数量和当前步数
-                remaining_cities = len(unvisited_indices) / len(visited_mask)  # 归一化
-                current_steps = np.sum(visited_mask) / len(visited_mask)  # 归一化
-                
-                # 构建特征向量 [x坐标, y坐标, 到当前城市的距离, 已访问比例, 剩余城市比例, 当前步数比例]
-                feature = [
-                    relative_x,
-                    relative_y,
-                    distance,
-                    visited_ratio,
-                    remaining_cities,
-                    current_steps
-                ]
-                
-                # 确保特征向量的长度与模型输入维度一致
-                expected_dim = self.config['model'].get('input_dim', 4)
-                if len(feature) < expected_dim:
-                    # 如果特征数量不足，填充零
-                    feature.extend([0.0] * (expected_dim - len(feature)))
-                elif len(feature) > expected_dim:
-                    # 如果特征数量过多，截断
-                    feature = feature[:expected_dim]
-                
-                features_list.append(feature)
-            
-            # 转换为张量
-            features = torch.tensor(features_list, dtype=torch.float32)
-            
-            # 添加批次维度并返回 [1, num_features, n_dims]
-            state_tensor = features.unsqueeze(0).to(self.device)
-            
-            # 保存有效动作信息到模型，这样预测时可以使用
-            if hasattr(self, 'model') and hasattr(self.model, 'set_mask'):
-                # 创建城市掩码，将已访问的城市标记为True（掩码）
-                mask = torch.ones(1, len(coordinates), dtype=torch.bool).to(self.device)
-                # 将未访问的城市设置为False（可用）
-                for idx in unvisited_indices:
-                    mask[0, idx] = False
-                # 设置模型的动作掩码
-                self.model.set_mask(mask)
-                
-            return state_tensor
-            
-        except Exception as e:
-            self.logger.error(f"处理TSP状态时出错: {str(e)}")
-            import traceback
-            self.logger.error(traceback.format_exc())
-            # 返回一个安全的默认张量
-            return torch.zeros(1, 1, self.config['model'].get('input_dim', 4)).to(self.device)
+        """每一行始终对应原始城市 ID，访问掩码在选择动作时应用。"""
+        coordinates = state['coordinates']
+        current_pos = state['current_pos']
+        visited_ratio = state['visited_mask'].mean()
+        features = np.column_stack((
+            coordinates - coordinates[current_pos],
+            state['distance_matrix'][current_pos],
+            np.full(len(coordinates), visited_ratio),
+            np.full(len(coordinates), 1.0 - visited_ratio),
+            np.full(len(coordinates), visited_ratio),
+        ))
+        state_tensor = torch.as_tensor(features, dtype=torch.float32, device=self.device)
+        return self._adjust_features(state_tensor.unsqueeze(0), self.input_dim)
 
     def _handle_episode_end(self, episode, episode_reward, info):
         """处理回合结束"""
@@ -1423,43 +1367,9 @@ class RLTrainer:
             action_probs, state_values, _ = self.model(states_batch)
             self.logger.info(f"模型前向传播成功，动作概率形状: {action_probs.shape}, 状态值形状: {state_values.shape}")
             
-            # 计算策略损失 (Actor)
-            # 在TSP问题中，动作索引可能会超出范围，需要特殊处理
-            log_probs = torch.log(action_probs + 1e-10)
-            
-            # 确保动作索引在有效范围内
-            max_action_idx = action_probs.size(1) - 1
-            valid_actions = []
-            
-            # 优化TSP问题的动作索引处理
-            if self.config['problem']['type'] == 'tsp':
-                # 对于TSP问题，我们需要特殊处理动作索引
-                # 因为随着城市被访问，可选动作数量会减少
-                for i, action in enumerate(actions_batch):
-                    if action > max_action_idx:
-                        # 如果动作索引超出范围，检查是否有其他有效动作
-                        self.logger.warning(f"动作索引 {action.item()} 超出范围 [0, {max_action_idx}]")
-                        # 将超出范围的动作转换为有效范围内的随机动作
-                        valid_action = torch.randint(0, max_action_idx + 1, (1,)).item()
-                        self.logger.info(f"替换为随机有效动作: {valid_action}")
-                        valid_actions.append(valid_action)
-                    else:
-                        valid_actions.append(action.item())
-            else:
-                # 对于背包问题，保持原有处理方式
-                for i, action in enumerate(actions_batch):
-                    if action > max_action_idx:
-                        # 如果动作索引超出范围，裁剪并记录
-                        self.logger.warning(f"动作索引 {action.item()} 被裁剪为 {max_action_idx}")
-                        valid_actions.append(max_action_idx)
-                    else:
-                        valid_actions.append(action.item())
-            
-            valid_actions_batch = torch.tensor(valid_actions, dtype=torch.int64).to(self.device)
-            
-            # 使用有效动作索引计算策略损失
-            selected_log_probs = log_probs.gather(1, valid_actions_batch.unsqueeze(1))
-            
+            distribution = self._action_distribution(action_probs, states)
+            selected_log_probs = distribution.log_prob(actions_batch).unsqueeze(1)
+
             # 获取下一个状态的价值 - 同样处理三个返回值
             _, next_state_values, _ = self.model(next_states_batch)
             next_state_values = next_state_values.detach()
@@ -1477,10 +1387,12 @@ class RLTrainer:
             policy_loss = -(selected_log_probs * advantage).mean()
             
             # 熵损失 (用于鼓励探索)
-            entropy = -(action_probs * log_probs).sum(dim=1).mean()
+            entropy = distribution.entropy().mean()
             
             # 总损失
             loss = policy_loss + self.value_weight * value_loss - self.entropy_weight * entropy
+            if not torch.isfinite(loss).item():
+                raise RuntimeError("强化学习损失出现非有限值")
             
             # 优化
             self.optimizer.zero_grad()
@@ -1512,6 +1424,7 @@ class RLTrainer:
             self.logger.error(f"更新模型过程中出错: {str(e)}")
             import traceback
             self.logger.error(traceback.format_exc())
+            raise
 
     def _adjust_features(self, tensor, target_dim):
         """调整特征维度以匹配目标维度"""
@@ -1624,211 +1537,119 @@ class RLTrainer:
             raise e
 
     def test(self, visualize=False):
-        """测试模型"""
+        """Sample feasible solutions from one evaluation instance."""
         self.model.eval()
-        test_rewards = []
+        is_tsp = isinstance(self.env, TSPEnv)
+        rewards = []
         solutions = []
-        objectives_list = []
-        
-        for episode in range(10):  # 测试10个episode
-            state = self.env.reset()
+        objectives = []
+
+        for episode in range(10):
+            state = self.env.reset(regenerate=False, start_city=0) if is_tsp else self.env.reset()
             done = False
             episode_reward = 0
-            current_solution = []
-            
+            selection = []
+
             while not done:
-                # 处理状态
-                state_tensor = self._process_state(state)
-                
-                # 获取动作概率
                 with torch.no_grad():
-                    action_probs, _, _ = self.model(state_tensor)
-                
-                # 选择动作
-                action = torch.argmax(action_probs).item()
-                
-                # 执行动作
-                next_state, reward, done, _ = self.env.step(action)
+                    action_probs, _, _ = self.model(self._process_state(state))
+                    distribution = self._action_distribution(action_probs, [state])
+                    action = (distribution.sample() if episode else distribution.probs.argmax()).item()
+
+                state, reward, done, info = self.env.step(action)
                 episode_reward += reward
-                state = next_state
-                current_solution.append(action)
-            
-            test_rewards.append(episode_reward)
-            solutions.append(current_solution)
-            
-            # 计算目标值
-            if isinstance(self.env, KnapsackEnv):
-                # 使用current_objectives替代单独的current_value等属性
-                objectives = {}
-                
-                # 确保目标与名称一致
-                for i, name in enumerate(self.env.objective_names):
-                    if i < len(self.env.current_objectives):
-                        objectives[name.lower()] = self.env.current_objectives[i]
-                    else:
-                        objectives[name.lower()] = 0
-                
-                # 为兼容性保留原始键名
-                if 'value' not in objectives and len(self.env.current_objectives) > 0:
-                    objectives['value'] = self.env.current_objectives[0]
-                if 'weight' not in objectives and len(self.env.current_objectives) > 1:
-                    objectives['weight'] = self.env.current_objectives[1]
-                if 'volume' not in objectives and len(self.env.current_objectives) > 2:
-                    objectives['volume'] = self.env.current_objectives[2]
-                if 'cost' not in objectives and len(self.env.current_objectives) > 3:
-                    objectives['cost'] = self.env.current_objectives[3]
-                if 'time' not in objectives and len(self.env.current_objectives) > 4:
-                    objectives['time'] = self.env.current_objectives[4]
-                
-                # 添加已选择物品数量
-                objectives['n_selected'] = len(current_solution)
-                
-                # 记录所有目标函数值
-                logging.info(f"初始化了{len(self.env.current_objectives)}个目标函数：{self.env.objective_names}")
-                for i, name in enumerate(self.env.objective_names):
-                    if i < len(self.env.current_objectives):
-                        logging.info(f"目标{i} ({name})值: {self.env.current_objectives[i]}")
-                        if i > 0 and i-1 < len(self.env.capacities):
-                            logging.info(f"目标{i} ({name})容量: {self.env.capacities[i-1]}")
-                
-                objectives_list.append(objectives)
-        
-        # 找到最佳解决方案
-        best_idx = int(np.argmax(test_rewards))
-        best_solution = solutions[best_idx]
-        best_objectives = objectives_list[best_idx] if objectives_list else None
-        
+                selection.append(action)
+
+            if is_tsp:
+                selection = info['tour']
+                if not self.env.problem.is_feasible(selection):
+                    raise ValueError("TSP 模型未返回完整闭合路线")
+                values = info['objectives']
+            else:
+                if not info['feasible'] or not self.env.problem.is_feasible(selection):
+                    continue
+                values = self.env.problem.compute_objectives(selection)
+
+            rewards.append(episode_reward)
+            solutions.append(selection)
+            objectives.append(values)
+
+        if not solutions:
+            raise ValueError("模型未找到满足背包容量上限的完整选择")
+
+        return self._candidate_test_results(solutions, objectives, rewards, is_tsp, visualize)
+
+    def _candidate_test_results(self, solutions, objectives, rewards, is_tsp, visualize):
+        problem = self.env.problem
+        names = self.env.objective_names
+        if is_tsp:
+            directions = self.env.objective_types
+        else:
+            configured = self.config['problem'].get('objective_types')
+            if configured is None:
+                configured = self.config.get('model', {}).get('objective_types')
+            directions = list(configured or [])[:len(names)]
+            defaults = [1] + [-1] * (len(names) - 1)
+            directions.extend(defaults[len(directions):])
+
+        first_index = {}
+        for index, solution in enumerate(solutions):
+            first_index.setdefault(tuple(solution), index)
+        candidates = list(first_index)
+        values = np.asarray([objectives[index] for index in first_index.values()])
+        frontier = nondominated_mask(values, directions)
+        best_index = int(max(np.flatnonzero(frontier), key=lambda i: rewards[first_index[candidates[i]]]))
+        best_solution = list(candidates[best_index])
+        best_values = values[best_index].tolist()
+        best_objectives = dict(zip(names, best_values))
+
+        problem_type = 'tsp' if is_tsp else 'knapsack'
+        solution_key = 'tour' if is_tsp else 'selection'
         results = {
-            'mean_reward': float(np.mean(test_rewards)),
-            'std_reward': float(np.std(test_rewards))
+            'mean_reward': float(np.mean(rewards)),
+            'std_reward': float(np.std(rewards)),
+            'num_candidates': len(candidates),
+            'num_nondominated': int(frontier.sum()),
         }
-        
-        if best_objectives:
-            results.update({
-                'total_value': float(best_objectives['value']),
-                'total_weight': float(best_objectives['weight']),
-                'total_volume': float(best_objectives['volume']),
-                'total_cost': float(best_objectives['cost']),
-                'selected_items': int(best_objectives['n_selected'])
-            })
-        
-        # 添加可视化处理
-        if visualize and best_objectives:
-            try:
-                # 创建solutions目录
-                os.makedirs('solutions', exist_ok=True)
-                
-                # 准备可视化所需数据
-                from src.utils.visualization import ProblemVisualizer
-                visualizer = ProblemVisualizer(use_english_labels=True)  # 强制使用英文标签，避免中文字体问题
-                
-                # 获取环境的当前状态
-                state = self.env.reset()
-                for action in best_solution:
-                    state, _, _, _ = self.env.step(action)
-                
-                # 从state中构建问题实例
-                problem_data = {}
-                
-                if isinstance(self.env, KnapsackEnv):
-                    # 获取实际目标名称和约束
-                    objective_names = self.env.objective_names
-                    # 构建容量字典，将每个约束与其名称关联
-                    capacities = {}
-                    for i in range(1, len(self.env.objective_names)):  # 从1开始，跳过价值目标
-                        if i-1 < len(self.env.capacities):
-                            name = self.env.objective_names[i]
-                            capacities[f"{name}_capacity"] = self.env.capacities[i-1]
-                    
-                    problem_data = {
-                        'items': self.env.problem.items.reshape(-1, self.env.num_objectives),
-                        'objective_names': objective_names,
-                        'objective_types': self.config.get('model', {}).get('objective_types',
-                                          [1] + [-1] * (len(objective_names) - 1))
-                    }
-                    
-                    # 添加所有容量约束
-                    problem_data.update(capacities)
-                
-                # 提取所有解的目标值
-                # 确保支持动态数量的目标函数
-                num_objectives = len(self.env.current_objectives)
-                all_objectives = []
-                
-                for obj in objectives_list:
-                    obj_values = []
-                    # 从环境中获取所有目标名称
-                    for i, name in enumerate(self.env.objective_names):
-                        name_lower = name.lower()
-                        # 尝试使用目标名称获取值
-                        if name_lower in obj:
-                            obj_values.append(obj[name_lower])
-                        # 尝试使用通用名称获取值
-                        elif i == 0 and 'value' in obj:
-                            obj_values.append(obj['value'])
-                        elif i == 1 and 'weight' in obj:
-                            obj_values.append(obj['weight'])
-                        elif i == 2 and 'volume' in obj:
-                            obj_values.append(obj['volume'])
-                        elif i == 3 and 'cost' in obj:
-                            obj_values.append(obj['cost'])
-                        elif i == 4 and 'time' in obj:
-                            obj_values.append(obj['time'])
-                        else:
-                            # 对于额外的目标，如果没有具体名称，使用索引
-                            obj_key = f'objective_{i}'
-                            if obj_key in obj:
-                                obj_values.append(obj[obj_key])
-                            else:
-                                obj_values.append(0)  # 默认值
-                    
-                    # 确保目标值数量与目标数量匹配
-                    while len(obj_values) < num_objectives:
-                        obj_values.append(0)  # 添加默认值
-                    
-                    all_objectives.append(obj_values[:num_objectives])  # 只保留需要的目标数量
-                
-                if all_objectives:
-                    all_objectives = np.array(all_objectives)
-                    
-                    # 添加当前解
-                    solution_obj = []
-                    for i in range(num_objectives):
-                        if i < len(self.env.current_objectives):
-                            solution_obj.append(self.env.current_objectives[i])
-                        else:
-                            solution_obj.append(0)  # 默认值
-                    
-                    solution_obj = np.array(solution_obj)
-                    all_objectives = np.vstack([all_objectives, solution_obj])
-                    
-                    # 可视化Pareto前沿
-                    visualizer.visualize_pareto_front(all_objectives)
-                    
-                    # 高维可视化
-                    if num_objectives > 3:
-                        try:
-                            visualizer.visualize_high_dimensional_solution(
-                                problem={
-                                    'items': problem_data.get('items', self.env.problem.items) if hasattr(self.env, 'problem') else [],  # 正确传递物品数据
-                                    'objective_names': self.env.objective_names if hasattr(self.env, 'objective_names') else None,
-                                    'objective_types': self.env.problem.objective_types if hasattr(self.env.problem, 'objective_types') else None
-                                },
-                                solution=np.array(best_solution, dtype=np.int32),  # 使用已转换的best_solution
-                                objectives=np.array(all_objectives)
-                            )
-                        except Exception as e:
-                            logging.error(f"高维可视化失败: {e}")
-                    else:
-                        try:
-                            visualizer.visualize_problem_and_solution(problem_data, best_solution)
-                        except Exception as e:
-                            logging.error(f"问题可视化失败: {e}")
-                    
-                    logging.info("可视化结果已保存到 solutions 目录")
-            except Exception as e:
-                logging.error(f"生成可视化时出错: {str(e)}")
-        
+        for name, value in best_objectives.items():
+            logging.info(f"目标 {name}: {value:.6f}")
+        logging.info(f"{problem_type} 候选解: {len(candidates)} 个，非支配解: {int(frontier.sum())} 个")
+
+        if visualize:
+            visualizer = ProblemVisualizer(use_english_labels=True)
+            if is_tsp:
+                visualizer.visualize_tsp_solution(self.env.coordinates, best_solution)
+                instance = {'coordinates': self.env.coordinates.tolist()}
+            else:
+                instance = {
+                    'items': problem.items.tolist(),
+                    'capacities': [float(limit) if np.isfinite(limit) else None for limit in problem.capacities],
+                }
+            visualizer.visualize_candidate_pareto(values, names, directions, frontier, problem_type)
+            with open(f'solutions/{problem_type}_candidates.json', 'w', encoding='utf-8') as output:
+                json.dump({
+                    **instance,
+                    'objective_names': names,
+                    'objective_types': directions,
+                    'selected_index': best_index,
+                    'candidates': [
+                        {solution_key: list(solution), 'objectives': row.tolist(), 'nondominated': bool(on_frontier)}
+                        for solution, row, on_frontier in zip(candidates, values, frontier)
+                    ],
+                }, output, ensure_ascii=False, indent=2, allow_nan=False)
+
+        if is_tsp:
+            results['tour_length'] = best_values[0]
+        else:
+            best_objectives = {name.lower(): value for name, value in best_objectives.items()}
+            for name, value in zip(('value', 'weight', 'volume', 'cost', 'time'), best_values):
+                best_objectives.setdefault(name, value)
+            best_objectives['n_selected'] = len(best_solution)
+            results['selected_items'] = len(best_solution)
+            for name in ('value', 'weight', 'volume', 'cost'):
+                if name in best_objectives:
+                    results[f'total_{name}'] = best_objectives[name]
+
         return results, best_solution, best_objectives
 
     def _save_training_losses(self):
@@ -1973,27 +1794,16 @@ def main():
         # 创建环境
         try:
             if config['problem']['type'] == 'knapsack':
-                # 为问题实例准备专门的配置
                 problem_config = {
                     'problem': {
-                        'type': 'knapsack',
+                        **config['problem'],
                         'num_categories': config['problem'].get('num_categories', 5),
                         'items_per_category': config['problem'].get('items_per_category', 4),
-                        'num_objectives': config['problem'].get('num_objectives', 3)  # 确保总是有一个默认值
+                        'num_objectives': config['problem'].get('num_objectives', 3),
                     },
-                    'model': {
-                        'objective_names': config.get('model', {}).get('objective_names', []),
-                        'objective_types': config.get('model', {}).get('objective_types', [1] + [-1] * (config['problem'].get('num_objectives', 3) - 1))
-                    }
+                    'model': config.get('model', {}),
                 }
-                
-                # 记录问题配置
-                logger.info(f"创建问题实例，配置:")
-                logger.info(f"  - 问题类型: 背包问题")
-                logger.info(f"  - 目标数量: {problem_config['problem']['num_objectives']}")
-                logger.info(f"  - 目标名称: {problem_config['model']['objective_names']}")
-                logger.info(f"  - 目标类型: {problem_config['model']['objective_types']}")
-                
+
                 # 使用专门配置创建问题实例
                 problem = problem_factory.create_problem('knapsack', problem_config)
                 

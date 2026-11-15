@@ -1,4 +1,3 @@
-import torch
 import numpy as np
 import logging
 from typing import Dict, List, Tuple, Any
@@ -31,7 +30,8 @@ class KnapsackEnv(BaseEnv):
                 shape=(self.num_categories, self.items_per_category, self.num_objectives),
                 dtype=np.float32
             ),
-            'current_category': spaces.Discrete(self.num_categories),
+            'current_category': spaces.Discrete(self.num_categories + 1),
+            'action_mask': spaces.MultiBinary(self.items_per_category),
             'selected': spaces.Box(
                 low=0, 
                 high=self.items_per_category-1, 
@@ -41,7 +41,7 @@ class KnapsackEnv(BaseEnv):
             'remaining_capacity': spaces.Box(
                 low=0,
                 high=np.inf,
-                shape=(self.num_objectives - 1,),  # 除了价值外的其他目标都作为约束
+                shape=(self.num_objectives,),
                 dtype=np.float32
             )
         })
@@ -51,25 +51,6 @@ class KnapsackEnv(BaseEnv):
             ['objective_1'] + [f'objective_{i+1}' for i in range(1, self.num_objectives)])
         
         logger.info(f"目标函数名称: {self.objective_names}")
-        
-        # 获取所有约束容量
-        self.capacities = []
-        
-        # 初始化容量
-        for i in range(1, self.num_objectives):  # 跳过第一个目标（价值）
-            # 构建可能的容量名称
-            capacity_name = f"{self.objective_names[i]}_capacity"
-            
-            # 获取容量值
-            if hasattr(problem, capacity_name):
-                capacity = getattr(problem, capacity_name)
-            else:
-                # 如果没有找到对应的容量，使用默认值
-                capacity = float('inf')
-                logger.warning(f"未找到{capacity_name}，使用默认值{capacity}")
-            
-            logger.info(f"目标 {i} ({self.objective_names[i]}) 容量设置为: {capacity}")
-            self.capacities.append(capacity)
         
         # 验证物品数据的维度
         if not hasattr(problem, 'items'):
@@ -111,6 +92,13 @@ class KnapsackEnv(BaseEnv):
         
         logger.info(f"物品数据维度: {problem.items.shape}")
         
+        minimum_totals = problem.items.min(axis=1).sum(axis=0)
+        for name, minimum, capacity in zip(self.objective_names, minimum_totals, problem.capacities):
+            if minimum > capacity:
+                raise ValueError(
+                    f"背包实例无可行解：{name} 最少需要 {minimum:.6g}，容量上限为 {capacity:.6g}"
+                )
+
         self.reset()
         
     def reset(self):
@@ -121,7 +109,9 @@ class KnapsackEnv(BaseEnv):
             self.episode_steps = 0
             
             # 初始化所有目标的当前值
-            self.current_objectives = [0] * self.num_objectives
+            self.current_objectives = np.zeros(self.num_objectives)
+            if not self.get_valid_actions():
+                raise ValueError("背包第一类物品没有同时满足所有容量上限的选项")
             
             state = self.get_state_representation()
             logger.info(f"环境重置成功，状态形状: {state['items'].shape}")
@@ -137,34 +127,25 @@ class KnapsackEnv(BaseEnv):
             action: int, 在当前类别中选择的物品索引
         """
         try:
-            self.episode_steps += 1
-            
             # 验证动作的有效性
             if not isinstance(action, (int, np.integer)):
                 raise ValueError(f"动作必须是整数，实际类型: {type(action)}")
             if action < 0 or action >= self.items_per_category:
                 raise ValueError(f"动作超出范围[0, {self.items_per_category}): {action}")
             
-            # 获取选择的物品属性
+            if action not in self.get_valid_actions():
+                raise ValueError(f"动作 {action} 违反背包容量约束或回合已结束")
+
+            self.episode_steps += 1
             current_category = self.current_state['current_category']
-            if current_category >= self.num_categories:
-                raise ValueError(f"当前类别{current_category}超出范围[0, {self.num_categories})")
-                
-            selected_item = self.current_state['items'][current_category, action]
-            
-            # 更新累积值
-            for i in range(self.num_objectives):
-                self.current_objectives[i] += selected_item[i]
-            
-            # 更新状态
+            self.current_objectives += self.current_state['items'][current_category, action]
             self.current_state = self.problem.get_next_state(self.current_state, action)
-            
-            # 检查是否完成
-            done = self.current_state['current_category'] >= self.num_categories
-            
-            # 计算奖励
-            reward = self.compute_reward(done)
-            
+
+            complete = self.current_state['current_category'] == self.num_categories
+            dead_end = not complete and not self.get_valid_actions()
+            done = complete or dead_end
+            reward = self.compute_reward(complete) - float(dead_end)
+
             self.episode_rewards.append(reward)
             
             # 获取下一个状态
@@ -177,7 +158,7 @@ class KnapsackEnv(BaseEnv):
                 logger.info(f"是否完成: {done}")
                 logger.info(f"当前目标值: {self.current_objectives}")
             
-            return next_state, reward, done, {}
+            return next_state, reward, done, {"feasible": complete}
             
         except Exception as e:
             logger.error(f"执行动作时出错: {str(e)}")
@@ -186,13 +167,10 @@ class KnapsackEnv(BaseEnv):
     def get_state_representation(self):
         """获取状态表示"""
         try:
-            # 计算剩余容量
-            remaining_capacities = []
-            for i in range(1, self.num_objectives):  # 跳过第一个目标（价值）
-                current_value = self.current_objectives[i]
-                remaining = max(0, self.capacities[i-1] - current_value)
-                remaining_capacities.append(remaining)
-            
+            remaining_capacities = np.maximum(0, self.problem.capacities - self.current_objectives)
+            action_mask = np.zeros(self.items_per_category, dtype=np.int8)
+            action_mask[self.get_valid_actions()] = 1
+
             items = self.current_state['items'].astype(np.float32)
             
             # 验证数据
@@ -203,6 +181,7 @@ class KnapsackEnv(BaseEnv):
                 'items': items,
                 'current_category': self.current_state['current_category'],
                 'selected': self.current_state['selected'],
+                'action_mask': action_mask,
                 'remaining_capacity': np.array(remaining_capacities, dtype=np.float32)
             }
             
@@ -210,55 +189,19 @@ class KnapsackEnv(BaseEnv):
             logger.error(f"获取状态表示时出错: {str(e)}")
             raise
         
+    @property
+    def capacities(self):
+        return self.problem.capacities
+
     def get_valid_actions(self):
-        """获取有效动作"""
-        current_category = self.current_state['current_category']
-        if current_category >= self.num_categories:
+        """返回当前类别中满足所有容量上限的物品索引。"""
+        category = self.current_state['current_category']
+        if category >= self.num_categories:
             return []
-            
-        valid_actions = []
-        items = self.current_state['items'][current_category]
-        
-        for i in range(self.items_per_category):
-            item = items[i]
-            # 检查所有约束
-            valid = True
-            for j in range(1, self.num_objectives):  # 跳过第一个目标（价值）
-                if self.current_objectives[j] + item[j] > self.capacities[j-1]:
-                    valid = False
-                    break
-            if valid:
-                valid_actions.append(i)
-                
-        return valid_actions if valid_actions else list(range(self.items_per_category))
-        
+        totals = self.current_objectives + self.current_state['items'][category]
+        return np.flatnonzero(np.all(totals <= self.problem.capacities, axis=1)).tolist()
+
     def compute_reward(self, done):
-        """计算奖励"""
-        # 计算价值比（第一个目标）
+        """奖励累计价值，对完成全部类别的可行选择额外奖励。"""
         value_ratio = self.current_objectives[0] / (self.problem.items[:, :, 0].sum() + 1e-6)
-        
-        # 基础奖励：价值比
-        reward = value_ratio
-        
-        # 约束惩罚
-        for i in range(1, self.num_objectives):
-            capacity = self.capacities[i-1]
-            current = self.current_objectives[i]
-            if current > capacity:
-                ratio = current / capacity
-                reward -= 2.0 * (ratio - 1.0)
-            
-        # 如果是最后一步，给予额外奖励或惩罚
-        if done:
-            feasible = True
-            for i in range(1, self.num_objectives):
-                if self.current_objectives[i] > self.capacities[i-1]:
-                    feasible = False
-                    break
-            
-            if feasible:
-                reward += 1.0
-            else:
-                reward -= 1.0
-                
-        return reward
+        return value_ratio + float(done)

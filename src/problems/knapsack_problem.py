@@ -20,6 +20,8 @@ class KnapsackProblem(BaseProblem):
             self.objective_names = config.get('model', {}).get('objective_names', 
                 ['objective_1'] + [f'objective_{i+1}' for i in range(1, self.num_objectives)])
         
+        self.objective_names = list(self.objective_names)
+
         # 确保目标名称数量匹配目标数量
         while len(self.objective_names) < self.num_objectives:
             self.objective_names.append(f"objective_{len(self.objective_names) + 1}")
@@ -28,38 +30,43 @@ class KnapsackProblem(BaseProblem):
         if len(self.objective_names) > self.num_objectives:
             self.objective_names = self.objective_names[:self.num_objectives]
         
+        if len(set(self.objective_names)) != self.num_objectives:
+            raise ValueError("目标名称必须唯一")
+
         # 生成物品数据
-        self.items = self._generate_items()
-        
-        # 初始化所有目标的容量
-        self.capacities = []
-        
-        # 初始化能力属性
-        for i in range(1, self.num_objectives):  # 跳过第一个目标（价值）
-            # 计算该目标的总和
-            total_value = np.sum(self.items[:, :, i])
-            
-            # 设置容量为总值的一半，这样可以迫使算法做出选择
-            capacity = total_value * 0.5
-            
-            # 设置属性
-            capacity_name = f"{self.objective_names[i]}_capacity"
-            setattr(self, capacity_name, capacity)
-            self.capacities.append(capacity)
-            
-            # 为兼容性保留原始属性名
-            if i == 1:
-                self.weight_capacity = capacity
-            elif i == 2:
-                self.volume_capacity = capacity
-            elif i == 3:
-                self.cost_capacity = capacity
-        
-        # 打印目标信息
-        print(f"初始化了{self.num_objectives}个目标函数：{self.objective_names[:self.num_objectives]}")
-        for i in range(1, self.num_objectives):
-            print(f"目标{i} ({self.objective_names[i]})容量: {getattr(self, f'{self.objective_names[i]}_capacity')}")
-        
+        configured_items = config['problem'].get('items')
+        self.items = self._generate_items() if configured_items is None else np.asarray(configured_items, dtype=float)
+        expected_shape = (self.num_categories, self.items_per_category, self.num_objectives)
+        if self.items.shape != expected_shape or not np.isfinite(self.items).all() or np.any(self.items < 0):
+            raise ValueError(f"背包物品必须是形状为 {expected_shape} 的有限非负数数组")
+
+        self._update_capacities()
+
+    def _update_capacities(self):
+        limits = self.config['problem'].get('objective_constraints')
+        if limits is None:
+            totals = self.items.sum(axis=(0, 1))
+            limits = dict(zip(self.objective_names[1:], totals[1:] * 0.5))
+
+        unknown_names = limits.keys() - set(self.objective_names)
+        if unknown_names:
+            raise ValueError(f"未知的容量约束目标: {sorted(unknown_names)}")
+        for name, limit in limits.items():
+            if not np.isfinite(limit) or limit < 0:
+                raise ValueError(f"目标 {name} 的容量必须是有限的非负数")
+
+        self.capacities = np.array(
+            [limits.get(name, np.inf) for name in self.objective_names]
+        )
+        for name, capacity in zip(self.objective_names, self.capacities):
+            setattr(self, f"{name}_capacity", capacity)
+        names_to_capacities = {
+            name.casefold(): capacity for name, capacity in zip(self.objective_names, self.capacities)
+        }
+        for index, name in enumerate(('weight', 'volume', 'cost'), start=1):
+            default = self.capacities[index] if index < self.num_objectives else np.inf
+            setattr(self, f"{name}_capacity", names_to_capacities.get(name, default))
+
     def generate_instance(self, size=None):
         """生成问题实例
         
@@ -72,14 +79,8 @@ class KnapsackProblem(BaseProblem):
         # 生成新的物品数据
         self.items = self._generate_items()
         
-        # 更新容量约束
-        total_weight = np.sum(self.items[:, :, 1])
-        total_volume = np.sum(self.items[:, :, 2])
-        total_cost = np.sum(self.items[:, :, 3])
-        self.weight_capacity = total_weight * 0.5
-        self.volume_capacity = total_volume * 0.5
-        self.cost_capacity = total_cost * 0.5
-        
+        self._update_capacities()
+
         # 生成一个随机初始解
         initial_solution = self.get_random_solution()
         
@@ -112,14 +113,8 @@ class KnapsackProblem(BaseProblem):
             # 更新物品数据
             self.items = items_data
             
-            # 更新容量约束
-            total_weight = np.sum(items_data[:, :, 1])
-            total_volume = np.sum(items_data[:, :, 2])
-            total_cost = np.sum(items_data[:, :, 3])
-            self.weight_capacity = total_weight * 0.5
-            self.volume_capacity = total_volume * 0.5
-            self.cost_capacity = total_cost * 0.5
-            
+            self._update_capacities()
+
             # 生成一个随机初始解
             initial_solution = self.get_random_solution()
             
@@ -238,19 +233,14 @@ class KnapsackProblem(BaseProblem):
         Returns:
             bool: 是否可行
         """
-        objectives = self.compute_objectives(selected)
-        
-        # 检查除第一个目标（价值）外的所有目标是否满足约束
-        for i in range(1, self.num_objectives):
-            objective_value = objectives[i]
-            capacity_name = f"{self.objective_names[i]}_capacity"
-            capacity = getattr(self, capacity_name)
-            
-            if objective_value > capacity:
-                return False
-        
-        return True
-                
+        selected = np.asarray(selected)
+        if (selected.shape != (self.num_categories,)
+                or not np.issubdtype(selected.dtype, np.integer)
+                or np.any(selected < 0)
+                or np.any(selected >= self.items_per_category)):
+            return False
+        return bool(np.all(self.compute_objectives(selected) <= self.capacities))
+
     def get_random_solution(self) -> np.ndarray:
         """生成随机解决方案
         

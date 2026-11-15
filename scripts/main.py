@@ -70,18 +70,22 @@ def parse_args():
                       help='是否可视化结果')
     parser.add_argument('--checkpoint', type=str,
                       help='模型检查点路径（仅在test模式下使用）')
-    parser.add_argument('--n-objectives', type=int, default=4,
-                      help='目标函数的数量（默认为3）')
+    parser.add_argument('--n-objectives', type=int,
+                      help='目标函数数量（默认使用配置）')
     parser.add_argument('--objective-types', type=str, default=None,
                       help='目标函数类型，格式为逗号分隔的1/-1列表，1表示最大化，-1表示最小化（例如：1,-1,-1）')
     parser.add_argument('--objective-names', type=str, default=None,
                       help='目标函数名称，格式为逗号分隔的名称列表（例如：价值,重量,体积）')
+    parser.add_argument('--instance', type=str,
+                      help='供背包强化学习训练或测试使用的实例 JSON')
     parser.add_argument('--config-file', type=str, default=None,
                       help='配置文件路径')
     return parser.parse_args()
 
 def main():
     args = parse_args()
+    if args.instance and (args.problem != 'knapsack' or not args.rl or args.mode == 'generate'):
+        raise ValueError("--instance 仅支持背包强化学习训练和测试")
     
     # 设置日志
     logging.basicConfig(
@@ -116,11 +120,21 @@ def main():
         config['model'] = {}
     
     # 设置目标数量
+    if args.n_objectives is None:
+        problem_config = config['problem']
+        args.n_objectives = problem_config.get(
+            'num_objectives', problem_config.get('n_objectives', config['model'].get('n_objectives', 4))
+        )
     config['model']['n_objectives'] = args.n_objectives
+    if args.problem == 'tsp':
+        config['problem']['num_objectives'] = args.n_objectives
+    if args.problem == 'knapsack' and args.rl:
+        config['model'].setdefault('input_dim', args.n_objectives + 1)
     
     # 处理命令行参数中的目标名称和类型
     if args.objective_names:
         objective_names = args.objective_names.split(',')
+        previous_names = config['problem'].get('objective_names', [])
         config['problem']['objective_names'] = objective_names
         
         # 如果启用了英文标签，尝试将中文目标名称转换为英文
@@ -130,6 +144,13 @@ def main():
             config['problem']['objective_names'] = visualizer._translate_objective_names(objective_names)
             logging.info(f"转换后的目标名称: {config['problem']['objective_names']}")
     
+        if 'objective_constraints' in config['problem']:
+            name_map = dict(zip(previous_names, config['problem']['objective_names']))
+            config['problem']['objective_constraints'] = {
+                name_map.get(name, name): limit
+                for name, limit in config['problem']['objective_constraints'].items()
+            }
+
     if args.objective_types:
         # 添加引号保护，确保正确解析
         objective_types_str = args.objective_types.replace(' ', '')
@@ -149,7 +170,7 @@ def main():
             logging.info(f"使用默认目标类型: {config['problem']['objective_types']}")
     
     # 确保数据目录存在
-    for split in ['train', 'val', 'test']:
+    for split in ([] if args.instance else ['train', 'val', 'test']):
         data_dir = os.path.join('data', args.problem, split)
         os.makedirs(data_dir, exist_ok=True)
         if not os.path.exists(data_dir) or len(os.listdir(data_dir)) == 0:
@@ -194,6 +215,23 @@ def main():
                 if 'objective_types' in config['problem']:
                     problem_config['problem']['objective_types'] = config['problem']['objective_types']
                 
+                if 'objective_constraints' in config['problem']:
+                    problem_config['problem']['objective_constraints'] = config['problem']['objective_constraints']
+
+                if args.instance:
+                    with open(args.instance, encoding='utf-8') as instance_file:
+                        instance = json.load(instance_file)
+                    if not isinstance(instance, dict) or not isinstance(instance.get('items'), list):
+                        raise ValueError("实例 JSON 必须包含 items 数组")
+                    instance_names = instance.get('objective_names')
+                    accepted_names = [config['problem'].get('objective_names', [])]
+                    if args.objective_names:
+                        accepted_names.append(previous_names)
+                    if instance_names is not None and instance_names not in accepted_names:
+                        raise ValueError("实例目标名称或顺序与背包配置不一致")
+                    problem_config['problem']['items'] = instance['items']
+                    logging.info(f"使用背包实例: {args.instance}")
+
                 # 使用更新后的配置创建问题实例
                 problem = problem_factory.create_problem(args.problem, problem_config)
                 env = KnapsackEnv(problem)
@@ -218,16 +256,16 @@ def main():
                     'problem': {
                         'type': 'tsp',
                         'size': config['problem'].get('size', 20),
-                        'num_objectives': config['problem'].get('n_objectives', 4),
+                        'num_objectives': args.n_objectives,
                         'objective_names': config['problem'].get('objective_names', 
-                            ["总距离", "时间窗口", "平衡性", "成本"]),
+                            ["总距离", "时间窗口迟到量", "路段长度变异系数", "最长路段"]),
                         'objective_types': config['problem'].get('objective_types', 
-                            [-1] * config['problem'].get('n_objectives', 4))
+                            [-1] * args.n_objectives)
                     },
                     'model': {
                         'objective_names': config.get('model', {}).get('objective_names', []),
                         'objective_types': config.get('model', {}).get('objective_types', 
-                            [-1] * config['problem'].get('n_objectives', 4))
+                            [-1] * args.n_objectives)
                     }
                 }
                 
@@ -321,6 +359,9 @@ def main():
                 if 'error' in results:
                     logging.error(f"测试过程出错: {results['error']}")
                 else:
+                    if 'tour_length' in results:
+                        logging.info(f"TSP 路线长度: {results['tour_length']:.6f}")
+                        logging.info(f"闭合路线: {solution}")
                     if 'total_value' in results:
                         logging.info(f"总价值: {results['total_value']:.2f}")
                     if 'total_weight' in results:
