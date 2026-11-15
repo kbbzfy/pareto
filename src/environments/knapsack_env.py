@@ -92,6 +92,13 @@ class KnapsackEnv(BaseEnv):
         
         logger.info(f"物品数据维度: {problem.items.shape}")
         
+        minimum_totals = problem.items.min(axis=1).sum(axis=0)
+        for name, minimum, capacity in zip(self.objective_names, minimum_totals, problem.capacities):
+            if minimum > capacity:
+                raise ValueError(
+                    f"背包实例无可行解：{name} 最少需要 {minimum:.6g}，容量上限为 {capacity:.6g}"
+                )
+
         self.reset()
         
     def reset(self):
@@ -104,7 +111,7 @@ class KnapsackEnv(BaseEnv):
             # 初始化所有目标的当前值
             self.current_objectives = np.zeros(self.num_objectives)
             if not self.get_valid_actions():
-                raise ValueError("背包第一类物品没有满足容量上限的选项")
+                raise ValueError("背包第一类物品没有同时满足所有容量上限的选项")
             
             state = self.get_state_representation()
             logger.info(f"环境重置成功，状态形状: {state['items'].shape}")

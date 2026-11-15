@@ -75,3 +75,8 @@ class TestKnapsackCapacity(unittest.TestCase):
         state = KnapsackEnv(problem).reset()
         np.testing.assert_array_equal(state['action_mask'], [0, 1])
         self.assertTrue(problem.is_feasible([1, 1]))
+
+    def test_reports_capacity_below_minimum_required_total(self):
+        # Each class has a fitting item by itself, but two classes cannot fit together.
+        with self.assertRaisesRegex(ValueError, 'Weight 最少需要 2，容量上限为 1'):
+            KnapsackEnv(self.make_problem({'Weight': 1}))

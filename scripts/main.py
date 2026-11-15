@@ -76,12 +76,16 @@ def parse_args():
                       help='目标函数类型，格式为逗号分隔的1/-1列表，1表示最大化，-1表示最小化（例如：1,-1,-1）')
     parser.add_argument('--objective-names', type=str, default=None,
                       help='目标函数名称，格式为逗号分隔的名称列表（例如：价值,重量,体积）')
+    parser.add_argument('--instance', type=str,
+                      help='供背包强化学习训练或测试使用的实例 JSON')
     parser.add_argument('--config-file', type=str, default=None,
                       help='配置文件路径')
     return parser.parse_args()
 
 def main():
     args = parse_args()
+    if args.instance and (args.problem != 'knapsack' or not args.rl or args.mode == 'generate'):
+        raise ValueError("--instance 仅支持背包强化学习训练和测试")
     
     # 设置日志
     logging.basicConfig(
@@ -117,6 +121,8 @@ def main():
     
     # 设置目标数量
     config['model']['n_objectives'] = args.n_objectives
+    if args.problem == 'knapsack' and args.rl:
+        config['model'].setdefault('input_dim', args.n_objectives + 1)
     
     # 处理命令行参数中的目标名称和类型
     if args.objective_names:
@@ -157,7 +163,7 @@ def main():
             logging.info(f"使用默认目标类型: {config['problem']['objective_types']}")
     
     # 确保数据目录存在
-    for split in ['train', 'val', 'test']:
+    for split in ([] if args.instance else ['train', 'val', 'test']):
         data_dir = os.path.join('data', args.problem, split)
         os.makedirs(data_dir, exist_ok=True)
         if not os.path.exists(data_dir) or len(os.listdir(data_dir)) == 0:
@@ -204,6 +210,20 @@ def main():
                 
                 if 'objective_constraints' in config['problem']:
                     problem_config['problem']['objective_constraints'] = config['problem']['objective_constraints']
+
+                if args.instance:
+                    with open(args.instance, encoding='utf-8') as instance_file:
+                        instance = json.load(instance_file)
+                    if not isinstance(instance, dict) or not isinstance(instance.get('items'), list):
+                        raise ValueError("实例 JSON 必须包含 items 数组")
+                    instance_names = instance.get('objective_names')
+                    accepted_names = [config['problem'].get('objective_names', [])]
+                    if args.objective_names:
+                        accepted_names.append(previous_names)
+                    if instance_names is not None and instance_names not in accepted_names:
+                        raise ValueError("实例目标名称或顺序与背包配置不一致")
+                    problem_config['problem']['items'] = instance['items']
+                    logging.info(f"使用背包实例: {args.instance}")
 
                 # 使用更新后的配置创建问题实例
                 problem = problem_factory.create_problem(args.problem, problem_config)

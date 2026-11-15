@@ -34,8 +34,12 @@ class KnapsackProblem(BaseProblem):
             raise ValueError("目标名称必须唯一")
 
         # 生成物品数据
-        self.items = self._generate_items()
-        
+        configured_items = config['problem'].get('items')
+        self.items = self._generate_items() if configured_items is None else np.asarray(configured_items, dtype=float)
+        expected_shape = (self.num_categories, self.items_per_category, self.num_objectives)
+        if self.items.shape != expected_shape or not np.isfinite(self.items).all() or np.any(self.items < 0):
+            raise ValueError(f"背包物品必须是形状为 {expected_shape} 的有限非负数数组")
+
         self._update_capacities()
 
     def _update_capacities(self):

@@ -981,7 +981,7 @@ class RLTrainer:
         """验证配置参数的完整性"""
         required_params = {
             'training': ['num_episodes', 'buffer_size', 'batch_size', 'gamma', 
-                        'learning_rate', 'entropy_weight', 'value_weight'],
+                        'learning_rate', 'entropy_weight'],
             'model': ['input_dim', 'hidden_dim'],
             'problem': ['type']
         }
@@ -1132,7 +1132,7 @@ class RLTrainer:
                             raise
                     
                     # 定期保存检查点
-                    if (episode + 1) % self.config['training']['save_interval'] == 0:
+                    if (episode + 1) % self.config['training'].get('save_interval', 50) == 0:
                         try:
                             self._save_checkpoint()
                             logger.info(f"保存检查点成功: episode {episode+1}")
