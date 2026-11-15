@@ -121,6 +121,7 @@ def main():
     # 处理命令行参数中的目标名称和类型
     if args.objective_names:
         objective_names = args.objective_names.split(',')
+        previous_names = config['problem'].get('objective_names', [])
         config['problem']['objective_names'] = objective_names
         
         # 如果启用了英文标签，尝试将中文目标名称转换为英文
@@ -130,6 +131,13 @@ def main():
             config['problem']['objective_names'] = visualizer._translate_objective_names(objective_names)
             logging.info(f"转换后的目标名称: {config['problem']['objective_names']}")
     
+        if 'objective_constraints' in config['problem']:
+            name_map = dict(zip(previous_names, config['problem']['objective_names']))
+            config['problem']['objective_constraints'] = {
+                name_map.get(name, name): limit
+                for name, limit in config['problem']['objective_constraints'].items()
+            }
+
     if args.objective_types:
         # 添加引号保护，确保正确解析
         objective_types_str = args.objective_types.replace(' ', '')
@@ -194,6 +202,9 @@ def main():
                 if 'objective_types' in config['problem']:
                     problem_config['problem']['objective_types'] = config['problem']['objective_types']
                 
+                if 'objective_constraints' in config['problem']:
+                    problem_config['problem']['objective_constraints'] = config['problem']['objective_constraints']
+
                 # 使用更新后的配置创建问题实例
                 problem = problem_factory.create_problem(args.problem, problem_config)
                 env = KnapsackEnv(problem)

@@ -741,8 +741,8 @@ class Trainer:
                 for i, name in enumerate(self.env.objective_names):
                     if i < len(self.env.current_objectives):
                         logging.info(f"目标{i} ({name})值: {self.env.current_objectives[i]}")
-                        if i > 0 and i-1 < len(self.env.capacities):
-                            logging.info(f"目标{i} ({name})容量: {self.env.capacities[i-1]}")
+                        if i < len(self.env.capacities):
+                            logging.info(f"目标{i} ({name})容量: {self.env.capacities[i]}")
                 
                 objectives_list.append(objectives)
         
@@ -788,10 +788,10 @@ class Trainer:
                     objective_names = self.env.objective_names
                     # 构建容量字典，将每个约束与其名称关联
                     capacities = {}
-                    for i in range(1, len(self.env.objective_names)):  # 从1开始，跳过价值目标
-                        if i-1 < len(self.env.capacities):
+                    for i in range(len(self.env.objective_names)):
+                        if i < len(self.env.capacities):
                             name = self.env.objective_names[i]
-                            capacities[f"{name}_capacity"] = self.env.capacities[i-1]
+                            capacities[f"{name}_capacity"] = self.env.capacities[i]
                     
                     problem_data = {
                         'items': self.env.problem.items.reshape(-1, self.env.num_objectives),
@@ -1081,7 +1081,7 @@ class RLTrainer:
                             
                             # 创建动作分布并采样
                             try:
-                                action_dist = torch.distributions.Categorical(action_probs)
+                                action_dist = self._action_distribution(action_probs, [state])
                                 action = action_dist.sample()
                                 logger.debug(f"动作采样成功: {action.item()}")
                             except Exception as e:
@@ -1180,6 +1180,16 @@ class RLTrainer:
             except:
                 logger.error("无法保存错误时的模型状态")
             raise
+
+    def _action_distribution(self, action_probs, states):
+        if isinstance(self.env, KnapsackEnv):
+            masks = torch.as_tensor(
+                np.stack([state['action_mask'] for state in states]),
+                dtype=torch.bool,
+                device=action_probs.device,
+            )
+            action_probs = action_probs.masked_fill(~masks, 0.0)
+        return torch.distributions.Categorical(probs=action_probs)
 
     def _process_state(self, state):
         """处理状态为模型输入格式"""
@@ -1425,6 +1435,9 @@ class RLTrainer:
             
             # 计算策略损失 (Actor)
             # 在TSP问题中，动作索引可能会超出范围，需要特殊处理
+            if isinstance(self.env, KnapsackEnv):
+                distribution = self._action_distribution(action_probs, states)
+                action_probs = distribution.probs
             log_probs = torch.log(action_probs + 1e-10)
             
             # 确保动作索引在有效范围内
@@ -1645,14 +1658,20 @@ class RLTrainer:
                     action_probs, _, _ = self.model(state_tensor)
                 
                 # 选择动作
-                action = torch.argmax(action_probs).item()
+                distribution = self._action_distribution(action_probs, [state])
+                action = torch.argmax(distribution.probs).item()
                 
                 # 执行动作
-                next_state, reward, done, _ = self.env.step(action)
+                next_state, reward, done, info = self.env.step(action)
                 episode_reward += reward
                 state = next_state
                 current_solution.append(action)
             
+            if isinstance(self.env, KnapsackEnv) and (
+                not info['feasible'] or not self.env.problem.is_feasible(current_solution)
+            ):
+                continue
+
             test_rewards.append(episode_reward)
             solutions.append(current_solution)
             
@@ -1663,10 +1682,7 @@ class RLTrainer:
                 
                 # 确保目标与名称一致
                 for i, name in enumerate(self.env.objective_names):
-                    if i < len(self.env.current_objectives):
-                        objectives[name.lower()] = self.env.current_objectives[i]
-                    else:
-                        objectives[name.lower()] = 0
+                    objectives[name.lower()] = self.env.current_objectives[i]
                 
                 # 为兼容性保留原始键名
                 if 'value' not in objectives and len(self.env.current_objectives) > 0:
@@ -1688,11 +1704,14 @@ class RLTrainer:
                 for i, name in enumerate(self.env.objective_names):
                     if i < len(self.env.current_objectives):
                         logging.info(f"目标{i} ({name})值: {self.env.current_objectives[i]}")
-                        if i > 0 and i-1 < len(self.env.capacities):
-                            logging.info(f"目标{i} ({name})容量: {self.env.capacities[i-1]}")
+                        if np.isfinite(self.env.capacities[i]):
+                            logging.info(f"目标{i} ({name})容量: {self.env.capacities[i]}")
                 
                 objectives_list.append(objectives)
         
+        if not solutions:
+            raise ValueError("模型未找到满足背包容量上限的完整选择")
+
         # 找到最佳解决方案
         best_idx = int(np.argmax(test_rewards))
         best_solution = solutions[best_idx]
@@ -1706,11 +1725,11 @@ class RLTrainer:
         if best_objectives:
             results.update({
                 'total_value': float(best_objectives['value']),
-                'total_weight': float(best_objectives['weight']),
-                'total_volume': float(best_objectives['volume']),
-                'total_cost': float(best_objectives['cost']),
                 'selected_items': int(best_objectives['n_selected'])
             })
+            for name in ('weight', 'volume', 'cost'):
+                if name in best_objectives:
+                    results[f'total_{name}'] = float(best_objectives[name])
         
         # 添加可视化处理
         if visualize and best_objectives:
@@ -1734,12 +1753,12 @@ class RLTrainer:
                     # 获取实际目标名称和约束
                     objective_names = self.env.objective_names
                     # 构建容量字典，将每个约束与其名称关联
-                    capacities = {}
-                    for i in range(1, len(self.env.objective_names)):  # 从1开始，跳过价值目标
-                        if i-1 < len(self.env.capacities):
-                            name = self.env.objective_names[i]
-                            capacities[f"{name}_capacity"] = self.env.capacities[i-1]
-                    
+                    capacities = {
+                        f"{name}_capacity": capacity
+                        for name, capacity in zip(objective_names, self.env.capacities)
+                        if np.isfinite(capacity)
+                    }
+
                     problem_data = {
                         'items': self.env.problem.items.reshape(-1, self.env.num_objectives),
                         'objective_names': objective_names,
@@ -1973,27 +1992,16 @@ def main():
         # 创建环境
         try:
             if config['problem']['type'] == 'knapsack':
-                # 为问题实例准备专门的配置
                 problem_config = {
                     'problem': {
-                        'type': 'knapsack',
+                        **config['problem'],
                         'num_categories': config['problem'].get('num_categories', 5),
                         'items_per_category': config['problem'].get('items_per_category', 4),
-                        'num_objectives': config['problem'].get('num_objectives', 3)  # 确保总是有一个默认值
+                        'num_objectives': config['problem'].get('num_objectives', 3),
                     },
-                    'model': {
-                        'objective_names': config.get('model', {}).get('objective_names', []),
-                        'objective_types': config.get('model', {}).get('objective_types', [1] + [-1] * (config['problem'].get('num_objectives', 3) - 1))
-                    }
+                    'model': config.get('model', {}),
                 }
-                
-                # 记录问题配置
-                logger.info(f"创建问题实例，配置:")
-                logger.info(f"  - 问题类型: 背包问题")
-                logger.info(f"  - 目标数量: {problem_config['problem']['num_objectives']}")
-                logger.info(f"  - 目标名称: {problem_config['model']['objective_names']}")
-                logger.info(f"  - 目标类型: {problem_config['model']['objective_types']}")
-                
+
                 # 使用专门配置创建问题实例
                 problem = problem_factory.create_problem('knapsack', problem_config)
                 
