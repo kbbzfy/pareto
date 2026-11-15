@@ -70,8 +70,8 @@ def parse_args():
                       help='是否可视化结果')
     parser.add_argument('--checkpoint', type=str,
                       help='模型检查点路径（仅在test模式下使用）')
-    parser.add_argument('--n-objectives', type=int, default=4,
-                      help='目标函数的数量（默认为3）')
+    parser.add_argument('--n-objectives', type=int,
+                      help='目标函数数量（默认使用配置）')
     parser.add_argument('--objective-types', type=str, default=None,
                       help='目标函数类型，格式为逗号分隔的1/-1列表，1表示最大化，-1表示最小化（例如：1,-1,-1）')
     parser.add_argument('--objective-names', type=str, default=None,
@@ -120,7 +120,14 @@ def main():
         config['model'] = {}
     
     # 设置目标数量
+    if args.n_objectives is None:
+        problem_config = config['problem']
+        args.n_objectives = problem_config.get(
+            'num_objectives', problem_config.get('n_objectives', config['model'].get('n_objectives', 4))
+        )
     config['model']['n_objectives'] = args.n_objectives
+    if args.problem == 'tsp':
+        config['problem']['num_objectives'] = args.n_objectives
     if args.problem == 'knapsack' and args.rl:
         config['model'].setdefault('input_dim', args.n_objectives + 1)
     
@@ -251,7 +258,7 @@ def main():
                         'size': config['problem'].get('size', 20),
                         'num_objectives': args.n_objectives,
                         'objective_names': config['problem'].get('objective_names', 
-                            ["总距离", "时间窗口", "平衡性", "成本"]),
+                            ["总距离", "时间窗口迟到量", "路段长度变异系数", "最长路段"]),
                         'objective_types': config['problem'].get('objective_types', 
                             [-1] * args.n_objectives)
                     },

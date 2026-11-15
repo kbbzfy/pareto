@@ -3,6 +3,9 @@ from typing import List, Dict, Any
 from src.problems.base_problem import BaseProblem
 import math
 
+TSP_OBJECTIVE_NAMES = ("总距离", "时间窗口迟到量", "路段长度变异系数", "最长路段")
+
+
 class TSPProblem(BaseProblem):
     def __init__(self, config: Dict = None):
         """初始化TSP问题类
@@ -21,18 +24,26 @@ class TSPProblem(BaseProblem):
         self.coordinates = None
         self.distance_matrix = None
         
-        # 从配置获取目标数量
         problem_config = config.get('problem', {})
         self.num_objectives = problem_config.get('num_objectives', problem_config.get('n_objectives', 3))
-        
-        # 从配置获取目标名称
-        self.objective_names = config.get('problem', {}).get('objective_names', 
-                                         ["总距离", "时间窗口", "平衡性"])
-        
-        # 从配置获取目标类型（1为最大化，-1为最小化）
-        self.objective_types = config.get('problem', {}).get('objective_types', 
-                                         [-1, -1, -1])  # 默认全部最小化
-        
+        if not 1 <= self.num_objectives <= len(TSP_OBJECTIVE_NAMES):
+            raise ValueError("TSP 目前支持 1 至 4 个有明确计算定义的目标")
+
+        names = list(problem_config.get('objective_names') or ())[:self.num_objectives]
+        aliases = ({}, {"时间窗口": TSP_OBJECTIVE_NAMES[1]},
+                   {"平衡性": TSP_OBJECTIVE_NAMES[2]},
+                   {"成本": TSP_OBJECTIVE_NAMES[3], "cost": TSP_OBJECTIVE_NAMES[3],
+                    "最大段长": TSP_OBJECTIVE_NAMES[3]})
+        self.objective_names = [
+            aliases[i].get(name.casefold(), name) for i, name in enumerate(names)
+        ] + list(TSP_OBJECTIVE_NAMES[len(names):self.num_objectives])
+        if len(set(self.objective_names)) != self.num_objectives:
+            raise ValueError("TSP 目标名称必须唯一")
+        directions = list(problem_config.get('objective_types') or ())[:self.num_objectives]
+        self.objective_types = directions + [-1] * (self.num_objectives - len(directions))
+        if any(direction not in (-1, 1) for direction in self.objective_types):
+            raise ValueError("TSP 目标方向必须为 1（最大化）或 -1（最小化）")
+
     def generate_instance(self, size=None):
         """生成TSP问题实例"""
         if size is not None:
@@ -107,68 +118,27 @@ class TSPProblem(BaseProblem):
         
     def compute_objectives(self, solution):
         """计算多个目标函数值"""
-        # 初始化目标数组
-        objectives = np.zeros(self.num_objectives)
-        
-        # 目标1：总距离
-        total_distance = sum(self.distance_matrix[solution[i]][solution[i+1]] 
-                           for i in range(len(solution)-1))
-        objectives[0] = total_distance
-        
-        # 如果只有一个目标，直接返回
-        if self.num_objectives == 1:
-            return objectives
-        
-        # 目标2：时间窗口违反程度
-        if self.num_objectives > 1:
-            current_time = 0
-            time_violations = 0
-            for i in range(len(solution)-1):
-                current_city = solution[i]
-                next_city = solution[i+1]
-                # 假设每单位距离需要1单位时间
-                travel_time = self.distance_matrix[current_city][next_city]
-                current_time += travel_time
-                
-                # 模拟时间窗口约束 [earliest, latest]
-                earliest = current_city * 10  # 简单模拟时间窗口
-                latest = earliest + 20
-                
-                if current_time < earliest:
-                    time_violations += earliest - current_time
-                    current_time = earliest
-                elif current_time > latest:
-                    time_violations += current_time - latest
-            
-            objectives[1] = time_violations
-        
-        # 目标3：路径平衡性（使用相邻段距离的变异系数）
-        if self.num_objectives > 2:
-            segments = [self.distance_matrix[solution[i]][solution[i+1]] 
-                       for i in range(len(solution)-1)]
-            mean_dist = np.mean(segments)
-            if mean_dist > 0:
-                balance = np.std(segments) / mean_dist  # 使用变异系数
-            else:
-                balance = 0
-            
-            objectives[2] = balance
-        
-        # 目标4+：附加目标（如果需要）
-        if self.num_objectives > 3:
-            # 计算最长路段长度（最大化效率）
-            max_segment = max(self.distance_matrix[solution[i]][solution[i+1]] 
-                             for i in range(len(solution)-1))
-            objectives[3] = max_segment
-            
-        # 目标5+：根据需要添加更多目标
-        # 这里我们使用随机值作为示例，实际应用中应根据问题具体定义
-        for i in range(4, self.num_objectives):
-            # 使用基于总距离的派生目标
-            objectives[i] = total_distance * (0.8 + 0.4 * np.random.random())
-        
-        return objectives
-        
+        if not self.is_feasible(solution):
+            raise ValueError("TSP 目标值必须基于完整闭合路线计算")
+
+        segments = self.distance_matrix[solution[:-1], solution[1:]]
+        objectives = [float(segments.sum())]
+        if self.num_objectives >= 2:
+            # 示例窗口由城市 ID 定义，到达过早可以等待，回到出发城市无需再次服务。
+            arrival = 0.0
+            lateness = 0.0
+            for city, travel_time in zip(solution[1:-1], segments):
+                earliest = city * 10
+                arrival = max(arrival + travel_time, earliest)
+                lateness += max(0.0, arrival - (earliest + 20))
+            objectives.append(lateness)
+        if self.num_objectives >= 3:
+            mean_length = segments.mean()
+            objectives.append(segments.std() / mean_length if mean_length else 0.0)
+        if self.num_objectives >= 4:
+            objectives.append(segments.max())
+        return np.asarray(objectives)
+
     def is_feasible(self, solution):
         """检查解是否可行"""
         if len(solution) != self.dimension + 1:  # +1 因为要回到起点

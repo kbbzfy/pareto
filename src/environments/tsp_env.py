@@ -18,24 +18,10 @@ class TSPEnv(BaseEnv):
         self.distance_matrix = instance['distance_matrix']
         self.size = len(self.coordinates)
         
-        # 从问题获取目标名称和类型
-        self.num_objectives = getattr(problem, 'num_objectives', 4)  # 默认4个目标
-        self.objective_names = getattr(problem, 'objective_names', 
-                                     ["总距离", "时间窗口", "平衡性", "成本"])  # 默认4个目标名称
-        self.objective_types = getattr(problem, 'objective_types', 
-                                     [-1] * self.num_objectives)  # 默认全部最小化
-        
-        # 确保目标数量和名称列表长度一致
-        if len(self.objective_names) < self.num_objectives:
-            # 如果名称不足，用默认名称补充
-            for i in range(len(self.objective_names), self.num_objectives):
-                self.objective_names.append(f"目标_{i+1}")
-        
-        # 确保目标类型列表长度一致
-        if len(self.objective_types) < self.num_objectives:
-            # 如果类型不足，用-1（最小化）补充
-            self.objective_types.extend([-1] * (self.num_objectives - len(self.objective_types)))
-        
+        self.num_objectives = problem.num_objectives
+        self.objective_names = problem.objective_names
+        self.objective_types = problem.objective_types
+
         logger.info(f"TSPEnv初始化成功:")
         logger.info(f"城市数量: {self.size}")
         logger.info(f"目标数量: {self.num_objectives}")
@@ -55,7 +41,7 @@ class TSPEnv(BaseEnv):
         
         self.reset(regenerate=False)
 
-    def reset(self, regenerate=True):
+    def reset(self, regenerate=True, start_city=None):
         """重置回合，可保留城市实例用于同一问题的多次评估。"""
         if regenerate:
             instance = self.problem.generate_instance(self.size)
@@ -69,7 +55,10 @@ class TSPEnv(BaseEnv):
         self.episode_steps = 0
         
         # 随机选择起始城市
-        start_city = np.random.randint(0, self.size)
+        if start_city is None:
+            start_city = int(np.random.randint(0, self.size))
+        if not 0 <= start_city < self.size:
+            raise ValueError("TSP 起始城市超出范围")
         self.visited[start_city] = 1
         self.tour.append(start_city)
         

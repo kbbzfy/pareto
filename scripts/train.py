@@ -16,6 +16,7 @@ from src.environments.knapsack_env import KnapsackEnv
 from src.environments.tsp_env import TSPEnv
 from src.utils.replay_buffer import ReplayBuffer, Experience
 from src.utils.visualization import ProblemVisualizer
+from src.utils.pareto import nondominated_mask
 from collections import namedtuple
 import time
 import torch.nn.functional as F
@@ -1544,7 +1545,7 @@ class RLTrainer:
         objectives_list = []
         
         for episode in range(10):  # 测试10个episode
-            state = self.env.reset(regenerate=False) if is_tsp else self.env.reset()
+            state = self.env.reset(regenerate=False, start_city=0) if is_tsp else self.env.reset()
             done = False
             episode_reward = 0
             current_solution = []
@@ -1559,7 +1560,7 @@ class RLTrainer:
                 
                 # 选择动作
                 distribution = self._action_distribution(action_probs, [state])
-                action = torch.argmax(distribution.probs).item()
+                action = (distribution.sample() if is_tsp and episode > 0 else distribution.probs.argmax()).item()
                 
                 # 执行动作
                 next_state, reward, done, info = self.env.step(action)
@@ -1614,10 +1615,13 @@ class RLTrainer:
                 
                 objectives_list.append(objectives)
             elif is_tsp:
-                objectives_list.append(dict(zip(self.env.objective_names, info['objectives'])))
+                objectives_list.append(info['objectives'])
         
         if not solutions:
             raise ValueError("模型未找到满足背包容量上限的完整选择")
+
+        if is_tsp:
+            return self._tsp_test_results(solutions, objectives_list, test_rewards, visualize)
 
         # 找到最佳解决方案
         best_idx = int(np.argmax(test_rewards))
@@ -1629,16 +1633,6 @@ class RLTrainer:
             'std_reward': float(np.std(test_rewards))
         }
         
-        if is_tsp:
-            results['tour_length'] = float(self.env.problem._compute_tour_length(best_solution))
-            for name, value in best_objectives.items():
-                logging.info(f"目标 {name}: {value:.6f}")
-            if visualize:
-                ProblemVisualizer(use_english_labels=True).visualize_tsp_solution(
-                    self.env.coordinates, best_solution
-                )
-            return results, best_solution, best_objectives
-
         if best_objectives:
             results.update({
                 'total_value': float(best_objectives['value']),
@@ -1765,6 +1759,47 @@ class RLTrainer:
                 logging.error(f"生成可视化时出错: {str(e)}")
         
         return results, best_solution, best_objectives
+
+    def _tsp_test_results(self, solutions, objectives, rewards, visualize):
+        names = self.env.objective_names
+        directions = self.env.objective_types
+        first_index = {}
+        for index, tour in enumerate(solutions):
+            first_index.setdefault(tuple(tour), index)
+        unique_tours = list(first_index)
+        objective_values = np.asarray([objectives[index] for index in first_index.values()])
+        frontier = nondominated_mask(objective_values, directions)
+        best_index = max(np.flatnonzero(frontier), key=lambda index: rewards[first_index[unique_tours[index]]])
+        best_tour = list(unique_tours[best_index])
+        best_objectives = dict(zip(names, objective_values[best_index].tolist()))
+
+        for name, value in best_objectives.items():
+            logging.info(f"目标 {name}: {value:.6f}")
+        logging.info(f"TSP 候选路线: {len(unique_tours)} 条，非支配路线: {int(frontier.sum())} 条")
+        if visualize:
+            visualizer = ProblemVisualizer(use_english_labels=True)
+            visualizer.visualize_tsp_solution(self.env.coordinates, best_tour)
+            visualizer.visualize_tsp_pareto(objective_values, names, directions, frontier)
+            with open('solutions/tsp_candidates.json', 'w', encoding='utf-8') as output:
+                json.dump({
+                    'coordinates': self.env.coordinates.tolist(),
+                    'objective_names': names,
+                    'objective_types': directions,
+                    'selected_index': int(best_index),
+                    'candidates': [
+                        {'tour': list(tour), 'objectives': values.tolist(), 'nondominated': bool(on_frontier)}
+                        for tour, values, on_frontier in zip(unique_tours, objective_values, frontier)
+                    ],
+                }, output, ensure_ascii=False, indent=2)
+
+        results = {
+            'mean_reward': float(np.mean(rewards)),
+            'std_reward': float(np.std(rewards)),
+            'tour_length': objective_values[best_index, 0].item(),
+            'num_candidates': len(unique_tours),
+            'num_nondominated': int(frontier.sum()),
+        }
+        return results, best_tour, best_objectives
 
     def _save_training_losses(self):
         """保存训练损失图表"""

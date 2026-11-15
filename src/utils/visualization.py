@@ -2,6 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from typing import List, Dict
 import json
+from itertools import combinations
 import os
 import pandas as pd
 from pandas.plotting import parallel_coordinates
@@ -650,6 +651,34 @@ class ProblemVisualizer:
         ax.grid(True)
         fig.tight_layout()
         fig.savefig('solutions/tsp_solution.png')
+        plt.close(fig)
+
+    def visualize_tsp_pareto(self, values, names, directions, frontier):
+        """Plot pairwise projections of the candidate frontier calculated in all dimensions."""
+        translations = {
+            "总距离": "Total distance", "时间窗口迟到量": "Time-window lateness",
+            "路段长度变异系数": "Segment length CV", "最长路段": "Longest segment",
+        }
+        labels = [f"{translations.get(name, name)} ({'max' if direction == 1 else 'min'})"
+                  for name, direction in zip(names, directions)]
+        pairs = list(combinations(range(len(names)), 2)) or [(0, None)]
+        cols = min(3, len(pairs))
+        rows = (len(pairs) + cols - 1) // cols
+        fig, axes = plt.subplots(rows, cols, squeeze=False, figsize=(4.2 * cols, 3.4 * rows))
+        for ax, (x_index, y_index) in zip(axes.flat, pairs):
+            y_values = values[:, y_index] if y_index is not None else np.zeros(len(values))
+            ax.scatter(values[~frontier, x_index], y_values[~frontier], color='0.65', label='Dominated')
+            ax.scatter(values[frontier, x_index], y_values[frontier], color='tab:blue', label='Nondominated')
+            ax.set_xlabel(labels[x_index])
+            if y_index is not None:
+                ax.set_ylabel(labels[y_index])
+            else:
+                ax.set_yticks([])
+            ax.grid(alpha=0.25)
+        axes[0, 0].legend()
+        fig.suptitle('TSP candidate Pareto front (all objectives)')
+        fig.tight_layout()
+        fig.savefig('solutions/tsp_pareto_front.png')
         plt.close(fig)
 
     def visualize_high_dimensional_solution(self, problem: Dict, solution: List[int], objectives: np.ndarray):

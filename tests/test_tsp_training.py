@@ -6,6 +6,7 @@ import torch
 from scripts.train import RLTrainer
 from src.environments.tsp_env import TSPEnv
 from src.problems.tsp import TSPProblem
+from src.utils.pareto import nondominated_mask
 
 
 class TestTSPTraining(unittest.TestCase):
@@ -49,3 +50,25 @@ class TestTSPTraining(unittest.TestCase):
         expected = np.linalg.norm(np.diff(coordinates[tour], axis=0), axis=1).sum()
         self.assertAlmostEqual(metrics['tour_length'], expected)
         self.assertAlmostEqual(objectives[self.env.objective_names[0]], expected)
+
+
+    def test_objectives_use_arrival_at_destination_and_have_no_random_columns(self):
+        problem = TSPProblem({'problem': {
+            'size': 4, 'n_objectives': 4, 'objective_names': ['D', 'T', 'CV', 'Cost'],
+        }})
+        problem.coordinates = np.column_stack((np.arange(4), np.zeros(4)))
+        problem.distance_matrix = problem._compute_distance_matrix()
+        tour = [0, 3, 1, 2, 0]
+        segments = [3, 2, 1, 2]
+        expected = [8, 2, np.std(segments) / 2, 3]
+        np.testing.assert_allclose(problem.compute_objectives(tour), expected)
+        np.testing.assert_array_equal(problem.compute_objectives(tour), problem.compute_objectives(tour))
+        self.assertEqual(problem.objective_names[3], '最长路段')
+        with self.assertRaisesRegex(ValueError, '1 至 4'):
+            TSPProblem({'problem': {'n_objectives': 5}})
+
+    def test_pareto_mask_honors_min_and_max_directions(self):
+        values = [[5, 10], [4, 10], [6, 11], [4, 10], [2, 9]]
+        np.testing.assert_array_equal(
+            nondominated_mask(values, [-1, 1]), [False, True, True, True, True]
+        )

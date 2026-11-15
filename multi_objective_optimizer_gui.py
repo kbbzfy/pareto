@@ -12,6 +12,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVB
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QIcon, QPixmap, QTextCursor
 from datetime import datetime
+from src.problems.tsp import TSP_OBJECTIVE_NAMES
 
 class MultiObjectiveOptimizer(QMainWindow):
     def __init__(self):
@@ -254,7 +255,7 @@ class MultiObjectiveOptimizer(QMainWindow):
         
         # 为每种图表创建一个标签
         self.viz_images = {}
-        viz_types = ["pareto", "parallel", "radar", "heatmap"]
+        viz_types = ["pareto", "parallel", "radar", "heatmap", "tsp_route", "tsp_front"]
         
         for viz_type in viz_types:
             viz_group = QGroupBox(self.get_viz_title(viz_type))
@@ -356,10 +357,8 @@ class MultiObjectiveOptimizer(QMainWindow):
         self.objectives_table.setHorizontalHeaderLabels(["目标名称", "类型", "约束", "约束值", "最小值", "最大值"])
         
         # 默认值
-        default_names = ["价值", "重量", "体积", "成本"]
-        default_types = ["最大化", "最小化", "最小化", "最小化"]
-        default_constraints = ["否", "是", "是", "是"]
-        default_constraint_values = ["N/A", "100", "100", "100"]
+        is_tsp = self.problem_type.currentText() == "tsp"
+        default_names = TSP_OBJECTIVE_NAMES if is_tsp else ["价值", "重量", "体积", "成本"]
         default_min_values = ["20", "5", "10", "8"]
         default_max_values = ["300", "60", "150", "90"]
         
@@ -372,20 +371,21 @@ class MultiObjectiveOptimizer(QMainWindow):
             # 目标类型
             type_combo = QComboBox()
             type_combo.addItems(["最大化", "最小化"])
-            type_combo.setCurrentText("最大化" if i == 0 else "最小化")
+            type_combo.setCurrentText("最小化" if is_tsp or i > 0 else "最大化")
             self.objectives_table.setCellWidget(i, 1, type_combo)
             
             # 约束设置
             constraint_combo = QComboBox()
             constraint_combo.addItems(["是", "否"])
-            constraint_combo.setCurrentText("否" if i == 0 else "是")
+            constraint_combo.setCurrentText("否" if is_tsp or i == 0 else "是")
+            constraint_combo.setEnabled(not is_tsp)
             constraint_combo.currentTextChanged.connect(lambda text, row=i: self.on_constraint_changed(text, row))
             self.objectives_table.setCellWidget(i, 2, constraint_combo)
             
             # 约束值
             constraint_value = QLineEdit()
-            constraint_value.setText("N/A" if i == 0 else "100")
-            constraint_value.setEnabled(i > 0)
+            constraint_value.setText("100" if i > 0 and not is_tsp else "N/A")
+            constraint_value.setEnabled(i > 0 and not is_tsp)
             self.objectives_table.setCellWidget(i, 3, constraint_value)
             
             # 最小值和最大值
@@ -478,7 +478,9 @@ class MultiObjectiveOptimizer(QMainWindow):
             "pareto": "散点矩阵图",
             "parallel": "平行坐标图",
             "radar": "雷达图",
-            "heatmap": "热力图"
+            "heatmap": "热力图",
+            "tsp_route": "TSP 闭合路线",
+            "tsp_front": "TSP 候选帕累托前沿"
         }
         return titles.get(viz_type, viz_type.title())
     
@@ -507,6 +509,16 @@ class MultiObjectiveOptimizer(QMainWindow):
             "heatmap": "solutions/heatmap.png"
         }
         
+        is_tsp = self.problem_type.currentText() == "tsp"
+        if is_tsp:
+            viz_paths = {
+                "tsp_route": "solutions/tsp_solution.png",
+                "tsp_front": "solutions/tsp_pareto_front.png",
+            }
+        for viz_type, label in self.viz_images.items():
+            label.clear()
+            label.parent().setVisible(viz_type in viz_paths)
+
         # 添加调试信息
         print(f"正在刷新可视化，当前工作目录: {os.getcwd()}")
         print(f"查找以下文件: {list(viz_paths.values())}")
@@ -540,7 +552,7 @@ class MultiObjectiveOptimizer(QMainWindow):
                 print(f"加载可视化图像时出错: {viz_type} - {path}: {str(e)}")
         
         # 如果没有找到可视化结果，检查是否有特定图片，但不要加载high_dimensional_solution.png
-        if not found_any:
+        if not found_any and not is_tsp:
             print("没有找到标准可视化图像，尝试查找通用图像...")
             generic_paths = [
                 "solutions/latest_solution.png",
@@ -1257,38 +1269,15 @@ class MultiObjectiveOptimizer(QMainWindow):
             else:
                 self.data_type_label.setText(f"当前数据类型: {problem_type}")
         
-        if problem_type == "knapsack":
-            # 背包问题设置
-            self.num_categories_label.setText("类别数量:")
-            self.items_per_category_label.setText("每类物品数:")
-            self.items_per_category.setEnabled(True)
-            
-            # 设置默认目标
-            if self.objectives_table.rowCount() >= 4:
-                objectives = [("价值", "最大化"), ("重量", "最小化"), 
-                             ("体积", "最小化"), ("成本", "最小化")]
-                for i, (name, obj_type) in enumerate(objectives):
-                    if i < self.objectives_table.rowCount():
-                        self.objectives_table.item(i, 0).setText(name)
-                        type_combo = self.objectives_table.cellWidget(i, 1)
-                        type_combo.setCurrentText(obj_type)
-        
-        elif problem_type == "tsp":
-            # TSP问题设置
-            self.num_categories_label.setText("城市数量:")
-            self.items_per_category_label.setText("(不适用)")
-            self.items_per_category.setEnabled(False)
-            
-            # 设置默认目标
-            if self.objectives_table.rowCount() >= 3:
-                objectives = [("总距离", "最小化"), ("时间窗口", "最小化"), 
-                             ("平衡性", "最小化")]
-                for i, (name, obj_type) in enumerate(objectives):
-                    if i < self.objectives_table.rowCount():
-                        self.objectives_table.item(i, 0).setText(name)
-                        type_combo = self.objectives_table.cellWidget(i, 1)
-                        type_combo.setCurrentText(obj_type)
-        
+        is_tsp = problem_type == "tsp"
+        self.num_categories_label.setText("城市数量:" if is_tsp else "类别数量:")
+        self.items_per_category_label.setText("(不适用)" if is_tsp else "每类物品数:")
+        self.items_per_category.setEnabled(not is_tsp)
+        objective_range = (1, len(TSP_OBJECTIVE_NAMES)) if is_tsp else (4, 10)
+        self.n_objectives.setRange(*objective_range)
+        self.update_objectives_table()
+        self.refresh_visualization()
+
         # 清空数据表格
         self.data_table.clearContents()
         self.data_table.setRowCount(0)
